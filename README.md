@@ -95,11 +95,21 @@ and `curl -i -X POST https://<service>/tts -H "Content-Type: application/json" -
 
 ## RAM / cost notes
 
-No GPU needed — both models run on CPU. Rough resident memory with the defaults
-(`hf_alpha` + Whisper `base int8`) is ~0.8–1.2 GB, so:
+No GPU needed — both models run on CPU. Real-world behaviour observed:
 
-- **Render Standard (2 GB)** — comfortable. Recommended.
-- **512 MB tiers (Free/Starter)** — tight; set `WHISPER_MODEL=tiny` and expect
-  the free tier to **spin down when idle** (30–60 s cold start on the next hit).
-  The frontend shows a "Preparing SIA's voice…" state, and the first `/tts`
-  response is cached so subsequent hits are instant.
+- **Render Free (512 MB)** — **not recommended.** The shared CPU takes ~60 s to
+  cold-load a model (→ 502s past the proxy timeout), the instance spins down when
+  idle, and Kokoro + Whisper together **OOM-kill the worker** (502 with an empty
+  body, which the browser reports as a CORS error). Fine for a quick demo, not
+  for real use.
+- **Render Standard (2 GB, always-on)** — **recommended.** Holds both models
+  comfortably; with `WARMUP=1` the first request is fast. Use `WHISPER_MODEL=base`
+  here for better accuracy.
+- **Render Starter ($7, 512 MB, always-on)** — tight but possible: keep
+  `WHISPER_MODEL=tiny`, `KOKORO_MODEL=kokoro-v1.0.int8.onnx`, `CPU_THREADS=1`.
+  Always-on avoids the cold-start, but RAM is still near the edge if both models
+  load at once.
+
+`WARMUP=1` loads both models at boot (only helps on always-on plans). The frontend
+also retries through transient 502s and shows a "Preparing voice…" state, and each
+`/tts` clip is disk-cached so repeat answers are instant.

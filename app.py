@@ -108,8 +108,34 @@ def get_whisper():
     if _whisper is None:
         from faster_whisper import WhisperModel
 
-        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type=WHISPER_COMPUTE)
+        _whisper = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type=WHISPER_COMPUTE,
+            cpu_threads=int(os.getenv("CPU_THREADS", "1")),  # keep memory/threads low
+        )
     return _whisper
+
+
+@app.on_event("startup")
+def _warmup() -> None:
+    """Optionally load both models right after boot (WARMUP=1) on an always-on
+    instance, so the first user request isn't a ~60s cold model load. Runs in a
+    background thread so it never blocks the health check."""
+    if os.getenv("WARMUP", "0") != "1":
+        return
+
+    import threading
+
+    def load() -> None:
+        try:
+            get_kokoro()
+            get_whisper()
+            print("[warmup] models loaded")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warmup] failed: {exc}")
+
+    threading.Thread(target=load, daemon=True).start()
 
 
 class TtsRequest(BaseModel):

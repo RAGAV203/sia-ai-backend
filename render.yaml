@@ -19,10 +19,16 @@ services:
         value: en-us
       - key: TTS_SPEED
         value: "0.9"
+      # tiny keeps RAM low so Kokoro + Whisper fit together; use `base` for
+      # better accuracy if you're on the 2 GB Standard plan.
       - key: WHISPER_MODEL
-        value: base
+        value: tiny
       - key: WHISPER_COMPUTE
         value: int8
+      # Load both models at boot so the first request isn't a ~60s cold load.
+      # (Only helps on always-on plans; free instances spin down when idle.)
+      - key: WARMUP
+        value: "1"
       # Lock this down to your site's origin(s) in production, comma-separated,
       # e.g. "https://your-site.vercel.app". "*" is fine while developing.
       - key: ALLOW_ORIGINS
