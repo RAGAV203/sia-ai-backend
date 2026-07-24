@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.wav
+tts-cache/
+.venv/
+venv/
+*.onnx
+*.bin

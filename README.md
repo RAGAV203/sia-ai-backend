@@ -1,0 +1,80 @@
+# SIA Voice Service (TTS + STT)
+
+A small, self-contained FastAPI service that gives SIA **one consistent
+Indian-female voice on every browser/device** and cross-browser speech input —
+all open source, no paid APIs.
+
+| Endpoint | Method | In | Out |
+|----------|--------|----|-----|
+| `/tts`   | POST   | `{ "text": "..." }` (JSON) | `audio/wav` |
+| `/stt`   | POST   | `audio` file (multipart)   | `{ "text": "..." }` |
+| `/health`| GET    | –  | status JSON |
+| `/voices`| GET    | –  | list of Kokoro voice ids (confirm `hf_alpha`) |
+
+- **TTS** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) via
+  [`kokoro-onnx`](https://github.com/thewh1teagle/kokoro-onnx) (ONNX Runtime, no
+  PyTorch). Voice `hf_alpha` (Hindi female) + `lang=en-us` → warm Indian-accented
+  English. Clips are disk-cached, so the fixed set of answers is synthesized once.
+- **STT** — [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
+  (CTranslate2). Great on Indian-accented English.
+
+This is a **standalone repository** — deploy it to Render on its own; the Vite
+frontend only needs its URL via `VITE_API_URL`.
+
+## Run locally
+
+**Docker (matches production, includes espeak-ng/ffmpeg):**
+
+```bash
+docker build -t sia-voice .
+docker run -p 8000:8000 sia-voice
+# → http://localhost:8000/health
+```
+
+**Bare Python (needs system `espeak-ng` + `ffmpeg` installed):**
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python download_models.py          # fetch model weights once
+uvicorn app:app --reload --port 8000
+```
+
+Point the frontend at it with `VITE_API_URL=http://localhost:8000` (see the
+frontend's `.env.example`).
+
+## Deploy to Render
+
+1. Push this repo to GitHub.
+2. Render dashboard → **New + → Blueprint** → select the repo. It reads
+   [`render.yaml`](./render.yaml) and creates the `sia-voice` Docker web service.
+   (Or **New + → Web Service**, runtime **Docker**, root directory left as the
+   repo root.)
+3. After it goes live, copy the URL (e.g. `https://sia-voice.onrender.com`) and
+   set it as `VITE_API_URL` in your Vercel project, then redeploy the frontend.
+4. Set `ALLOW_ORIGINS` to your site's origin (e.g. `https://your-site.vercel.app`).
+
+The Dockerfile bakes the weights into the image, so cold starts don't
+re-download them. Render binds `$PORT` automatically.
+
+## Configuration (env vars)
+
+| Var | Default | Notes |
+|-----|---------|-------|
+| `TTS_VOICE` | `hf_alpha` | Any Kokoro voice id (see `/voices`). |
+| `TTS_LANG` | `en-us` | `en-us` = correct English + Indian timbre; `hi` = stronger Hindi phonology. |
+| `TTS_SPEED` | `0.9` | <1 slower/calmer. |
+| `WHISPER_MODEL` | `base` | `tiny` (lighter) → `small` (more accurate). |
+| `WHISPER_COMPUTE` | `int8` | `int8` is smallest/fastest on CPU. |
+| `ALLOW_ORIGINS` | `*` | Comma-separated allowed origins. |
+
+## RAM / cost notes
+
+No GPU needed — both models run on CPU. Rough resident memory with the defaults
+(`hf_alpha` + Whisper `base int8`) is ~0.8–1.2 GB, so:
+
+- **Render Standard (2 GB)** — comfortable. Recommended.
+- **512 MB tiers (Free/Starter)** — tight; set `WHISPER_MODEL=tiny` and expect
+  the free tier to **spin down when idle** (30–60 s cold start on the next hit).
+  The frontend shows a "Preparing SIA's voice…" state, and the first `/tts`
+  response is cached so subsequent hits are instant.

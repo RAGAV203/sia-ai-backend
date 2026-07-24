@@ -1,0 +1,27 @@
+# Render Blueprint — deploys the SIA voice service (TTS + STT).
+# In the Render dashboard: New + → Blueprint → point at THIS repo.
+services:
+  - type: web
+    name: sia-voice
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # 2 GB is comfortable for Kokoro + Whisper together. To try the 512 MB
+    # tiers, set WHISPER_MODEL=tiny (see the RAM notes in README.md).
+    plan: standard
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TTS_VOICE
+        value: hf_alpha
+      - key: TTS_LANG
+        value: en-us
+      - key: TTS_SPEED
+        value: "0.9"
+      - key: WHISPER_MODEL
+        value: base
+      - key: WHISPER_COMPUTE
+        value: int8
+      # Lock this down to your site's origin(s) in production, comma-separated,
+      # e.g. "https://your-site.vercel.app". "*" is fine while developing.
+      - key: ALLOW_ORIGINS
+        value: "*"

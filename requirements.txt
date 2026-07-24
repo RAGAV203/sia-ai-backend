@@ -1,0 +1,12 @@
+# --- API ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+
+# --- TTS: Kokoro-82M on ONNX Runtime (no PyTorch) ---
+kokoro-onnx>=0.4.9
+soundfile>=0.12
+numpy>=1.26,<2.3
+
+# --- STT: faster-whisper (CTranslate2) ---
+faster-whisper>=1.0

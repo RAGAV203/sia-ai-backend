@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Model weights (baked into the Docker image at build time; don't commit)
+*.onnx
+*.bin
+
+# Generated audio / cache
+*.wav
+tts-cache/
+
+# Env / editor / OS
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
