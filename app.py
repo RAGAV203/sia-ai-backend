@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from knowledge import GREETING, public_suggestions, resolve_answer
+
 # --- configuration (all overridable via environment variables) ---------------
 KOKORO_MODEL = os.getenv("KOKORO_MODEL", "kokoro-v1.0.onnx")
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "voices-v1.0.bin")
@@ -84,6 +86,10 @@ class TtsRequest(BaseModel):
     speed: Optional[float] = None
 
 
+class AskRequest(BaseModel):
+    question: str
+
+
 def _synth_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
     samples, sample_rate = get_kokoro().create(text, voice=voice, speed=speed, lang=lang)
     buf = io.BytesIO()
@@ -105,6 +111,20 @@ def health():
 def voices():
     """Handy for confirming hf_alpha is available on this build."""
     return {"voices": sorted(get_kokoro().get_voices())}
+
+
+@app.get("/content")
+def content():
+    """Greeting + suggestion chips for the frontend to render on load."""
+    return {"greeting": GREETING, "suggestions": public_suggestions()}
+
+
+@app.post("/ask")
+def ask(req: AskRequest):
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="`question` is required")
+    return {"answer": resolve_answer(question)}
 
 
 @app.post("/tts")

@@ -8,8 +8,14 @@ all open source, no paid APIs.
 |----------|--------|----|-----|
 | `/tts`   | POST   | `{ "text": "..." }` (JSON) | `audio/wav` |
 | `/stt`   | POST   | `audio` file (multipart)   | `{ "text": "..." }` |
+| `/ask`   | POST   | `{ "question": "..." }` (JSON) | `{ "answer": "..." }` |
+| `/content`| GET   | –  | `{ "greeting": "...", "suggestions": [...] }` |
 | `/health`| GET    | –  | status JSON |
 | `/voices`| GET    | –  | list of Kokoro voice ids (confirm `hf_alpha`) |
+
+The **knowledge base and answering logic** live in [`knowledge.py`](./knowledge.py)
+— edit the greeting, chips, and answers there and redeploy; no frontend rebuild
+needed.
 
 - **TTS** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) via
   [`kokoro-onnx`](https://github.com/thewh1teagle/kokoro-onnx) (ONNX Runtime, no
