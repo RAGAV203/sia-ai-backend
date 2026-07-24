@@ -74,6 +74,25 @@ re-download them. Render binds `$PORT` automatically.
 | `WHISPER_COMPUTE` | `int8` | `int8` is smallest/fastest on CPU. |
 | `ALLOW_ORIGINS` | `*` | Comma-separated allowed origins. |
 
+## Troubleshooting
+
+**502 Bad Gateway + a "No 'Access-Control-Allow-Origin' header" (CORS) error in the
+browser** — these are almost always the *same* problem, not two. A 502 comes from
+Render's proxy (not the app), so it carries no CORS headers, and the browser reports it
+as a CORS failure. The app's own errors *do* include CORS headers, so a genuine CORS
+error here means the worker crashed. Usual causes:
+
+- **Out of memory (exit 137).** Kokoro + Whisper exceeded the instance RAM. Check the
+  Render **Logs** for `Out of memory` / `exit status 137`. Fixes: this repo now defaults
+  to the **int8** Kokoro model (`KOKORO_MODEL=kokoro-v1.0.int8.onnx`, ~88 MB); also set
+  `WHISPER_MODEL=tiny`, or move to the **Standard (2 GB)** plan.
+- **Free-tier cold start.** Free instances spin down when idle; the first request wakes
+  them and can 502 for a few seconds. The frontend retries automatically, so it recovers —
+  but to avoid it entirely use a plan that stays warm.
+
+Confirm the service directly (bypasses the browser/CORS): `curl -i https://<service>/health`
+and `curl -i -X POST https://<service>/tts -H "Content-Type: application/json" -d '{"text":"hello"}' -o out.wav`.
+
 ## RAM / cost notes
 
 No GPU needed — both models run on CPU. Rough resident memory with the defaults

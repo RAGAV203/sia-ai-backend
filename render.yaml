@@ -5,12 +5,14 @@ services:
     name: sia-voice
     runtime: docker
     dockerfilePath: ./Dockerfile
-    # 2 GB is comfortable for Kokoro + Whisper together. To try the 512 MB
-    # tiers, set WHISPER_MODEL=tiny (see the RAM notes in README.md).
+    # int8 model keeps RAM low. `standard` (2 GB) is comfortable; to fit the
+    # 512 MB tiers also set WHISPER_MODEL=tiny (see the RAM notes in README.md).
     plan: standard
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: KOKORO_MODEL
+        value: kokoro-v1.0.int8.onnx
       - key: TTS_VOICE
         value: hf_alpha
       - key: TTS_LANG

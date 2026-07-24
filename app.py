@@ -22,15 +22,17 @@ from pathlib import Path
 from typing import Optional
 
 import soundfile as sf
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from knowledge import GREETING, public_suggestions, resolve_answer
 
 # --- configuration (all overridable via environment variables) ---------------
-KOKORO_MODEL = os.getenv("KOKORO_MODEL", "kokoro-v1.0.onnx")
+# int8 by default → low RAM so small instances don't OOM (which shows up as a
+# 502 + a misleading "CORS missing" in the browser).
+KOKORO_MODEL = os.getenv("KOKORO_MODEL", "kokoro-v1.0.int8.onnx")
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "voices-v1.0.bin")
 # hf_alpha = Hindi female → Indian-accented English. lang="en-us" keeps English
 # pronunciation correct while the speaker embedding supplies the Indian accent.
@@ -56,9 +58,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _cors_origin(request: Request) -> str:
+    origin = request.headers.get("origin", "")
+    if "*" in ALLOW_ORIGINS or not ALLOW_ORIGINS:
+        return "*"
+    return origin if origin in ALLOW_ORIGINS else ALLOW_ORIGINS[0]
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Guarantee CORS headers even on unexpected 500s, so a real server error
+    never masquerades as a CORS problem in the browser. (A bare 500 from the
+    default handler skips the CORS middleware.)"""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"internal error: {exc}"},
+        headers={"Access-Control-Allow-Origin": _cors_origin(request)},
+    )
+
+
 # --- lazy model singletons ---------------------------------------------------
 _kokoro = None
 _whisper = None
+
+
+def _resolve_model_path() -> str:
+    """Use the configured model if present, else whichever Kokoro model the
+    image actually has (build-time download may have used a fallback)."""
+    if Path(KOKORO_MODEL).exists():
+        return KOKORO_MODEL
+    for candidate in ("kokoro-v1.0.int8.onnx", "kokoro-v1.0.fp16.onnx", "kokoro-v1.0.onnx"):
+        if Path(candidate).exists():
+            return candidate
+    return KOKORO_MODEL  # let Kokoro raise a clear error
 
 
 def get_kokoro():
@@ -66,7 +99,7 @@ def get_kokoro():
     if _kokoro is None:
         from kokoro_onnx import Kokoro
 
-        _kokoro = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+        _kokoro = Kokoro(_resolve_model_path(), KOKORO_VOICES)
     return _kokoro
 
 

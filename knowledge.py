@@ -21,7 +21,7 @@ SUGGESTIONS: List[Dict[str, str]] = [
         "chip": "Academic Programs",
         "question": "What academic programs do you offer?",
         "answer": (
-            "Great question. Shri Shankarlal Sundarbai Shasun Jain College for Women "
+            "Good question. Shri Shankarlal Sundarbai Shasun Jain College for Women "
             "offers a rich variety of programs across Arts, Science, Commerce, and Media "
             "Studies. On the undergraduate side, you will find popular choices like B.Com "
             "in General, Corporate Secretaryship, Accounting and Finance, as well as "
