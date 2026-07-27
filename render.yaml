@@ -25,9 +25,15 @@ services:
         value: tiny
       - key: WHISPER_COMPUTE
         value: int8
-      # Load both models at boot so the first request isn't a ~60s cold load.
-      # (Only helps on always-on plans; free instances spin down when idle.)
-      - key: WARMUP
+      # Pre-synthesize every knowledge-base answer into the disk cache at boot
+      # (background thread, ~2-3 min on int8) so every answer the site actually
+      # plays is served from disk in milliseconds. Set to "0" only if the
+      # instance is too small to hold the models.
+      - key: PREWARM
+        value: "1"
+      # Also load Whisper at boot (~200 MB resident) so the first mic press
+      # isn't waiting on a model load. Set "0" on a 512 MB instance.
+      - key: PREWARM_STT
         value: "1"
       # Lock this down to your site's origin(s) in production, comma-separated,
       # e.g. "https://your-site.vercel.app". "*" is fine while developing.

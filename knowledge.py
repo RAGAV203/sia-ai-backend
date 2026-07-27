@@ -120,3 +120,13 @@ def resolve_answer(query: str) -> str:
 def public_suggestions() -> List[Dict[str, str]]:
     """Chips for the UI — question text only, answers stay server-side."""
     return [{"id": s["id"], "chip": s["chip"], "question": s["question"]} for s in SUGGESTIONS]
+
+
+def spoken_texts() -> List[str]:
+    """Every string SIA can ever say, in the order she is likely to say it.
+
+    The knowledge base is a fixed set, so the service pre-synthesizes all of
+    these at startup — after that every ``/tts`` call the site makes is a disk
+    cache hit and the avatar starts talking immediately.
+    """
+    return [GREETING] + [s["answer"] for s in SUGGESTIONS] + [FALLBACK_ANSWER]

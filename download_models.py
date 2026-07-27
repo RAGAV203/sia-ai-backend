@@ -14,7 +14,11 @@ import urllib.request
 from pathlib import Path
 
 RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+# app.py accepts KOKORO_MODEL=auto ("use the fastest weights on disk"), but a
+# downloader needs a concrete filename — resolve it to the lean int8 build.
 KOKORO_MODEL = os.getenv("KOKORO_MODEL", "kokoro-v1.0.int8.onnx")
+if KOKORO_MODEL == "auto":
+    KOKORO_MODEL = "kokoro-v1.0.int8.onnx"
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "voices-v1.0.bin")
 FALLBACK_MODEL = "kokoro-v1.0.onnx"  # always present in the release
 

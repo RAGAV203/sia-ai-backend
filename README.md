@@ -24,6 +24,25 @@ needed.
 - **STT** — [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
   (CTranslate2). Great on Indian-accented English.
 
+### Why answers play instantly
+
+Synthesis is not fast enough to do on demand: a full answer is ~40 s of audio,
+and Kokoro on CPU runs at roughly **0.4–0.9× real time**, so generating one
+takes 15–40 s. The avatar would sit in "thinking" that whole time.
+
+Since the knowledge base is a *fixed* set of strings, the service instead
+**pre-synthesizes every one of them at startup** (`PREWARM=1`, default) in a
+background thread. After that each `/tts` the site issues is a disk read:
+
+| | first boot (cold cache) | every request after |
+|---|---|---|
+| `/tts` per answer | 15–40 s (synthesizing) | **~10 ms** |
+| `/stt` per clip | ~4 s (loads Whisper) | **~1 s** |
+
+Progress is visible on `/health` (`prewarm: {done, total, ready}`), so you can
+tell "still warming up" apart from "broken". The cache lives in `TTS_CACHE_DIR`
+and survives restarts, so a second boot is instant.
+
 This is a **standalone repository** — deploy it to Render on its own; the Vite
 frontend only needs its URL via `VITE_API_URL`.
 
@@ -37,14 +56,20 @@ docker run -p 8000:8000 sia-voice
 # → http://localhost:8000/health
 ```
 
-**Bare Python (needs system `espeak-ng` + `ffmpeg` installed):**
+**Bare Python** — works on Windows/macOS/Linux with no system packages:
+`espeak-ng` ships inside `espeakng-loader`, and audio decoding uses PyAV, so
+no separate `ffmpeg` install is needed.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python download_models.py          # fetch model weights once
-uvicorn app:app --reload --port 8000
+uvicorn app:app --port 8000
 ```
+
+The first boot spends a couple of minutes filling the clip cache in the
+background — watch `/health` until `prewarm.ready` is `true`. Use `--reload`
+only while editing: every reload restarts the prewarm.
 
 Point the frontend at it with `VITE_API_URL=http://localhost:8000` (see the
 frontend's `.env.example`).
@@ -70,9 +95,21 @@ re-download them. Render binds `$PORT` automatically.
 | `TTS_VOICE` | `hf_alpha` | Any Kokoro voice id (see `/voices`). |
 | `TTS_LANG` | `en-us` | `en-us` = correct English + Indian timbre; `hi` = stronger Hindi phonology. |
 | `TTS_SPEED` | `0.9` | <1 slower/calmer. |
+| `KOKORO_MODEL` | `auto` | `auto` = fastest weights present (fp32 → fp16 → int8). Pin to `kokoro-v1.0.int8.onnx` for low RAM. |
+| `ONNX_THREADS` | `min(4, cores)` | Kokoro peaks near 4 threads and *regresses* past it. |
+| `PREWARM` | `1` | Pre-synthesize the knowledge base at boot. `0` on a tiny instance. |
+| `PREWARM_STT` | `1` | Load Whisper at boot (~200 MB). `0` on a tiny instance. |
+| `TTS_CACHE_DIR` | `./tts-cache` | Where synthesized clips are kept. |
 | `WHISPER_MODEL` | `base` | `tiny` (lighter) → `small` (more accurate). |
 | `WHISPER_COMPUTE` | `int8` | `int8` is smallest/fastest on CPU. |
 | `ALLOW_ORIGINS` | `*` | Comma-separated allowed origins. |
+
+**On model choice:** counter-intuitively the **fp32** Kokoro weights are ~2×
+*faster* than the int8 ones on CPU (measured RTF 0.42 vs 0.86) — ONNX Runtime's
+dynamically-quantized MatMul kernels lose to plain fp32 GEMM here — but cost
+~325 MB resident instead of ~92 MB. The Docker image only bakes int8, so
+containers stay lean; run `KOKORO_MODEL=kokoro-v1.0.onnx python download_models.py`
+to fetch the fast one where RAM allows.
 
 ## Troubleshooting
 

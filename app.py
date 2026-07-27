@@ -8,8 +8,10 @@ STT  : faster-whisper (CTranslate2). Robust on Indian-accented English and
        works from any browser (the client records audio and POSTs it here).
 
 Both models are loaded lazily and cached; synthesized clips are cached on disk
-keyed by (voice, lang, speed, text), so the site's fixed set of answers is only
-ever generated once.
+keyed by (voice, lang, speed, text). Because the knowledge base is a *fixed*
+set of answers, the service pre-synthesizes all of them on startup (PREWARM),
+so by the time a visitor asks anything the reply is already a disk hit and the
+avatar starts speaking immediately instead of waiting on the vocoder.
 """
 
 from __future__ import annotations
@@ -18,6 +20,9 @@ import hashlib
 import io
 import os
 import tempfile
+import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -26,13 +31,16 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from knowledge import GREETING, public_suggestions, resolve_answer
+from knowledge import GREETING, public_suggestions, resolve_answer, spoken_texts
+
+APP_DIR = Path(__file__).resolve().parent
 
 # --- configuration (all overridable via environment variables) ---------------
-# int8 by default → low RAM so small instances don't OOM (which shows up as a
-# 502 + a misleading "CORS missing" in the browser).
-KOKORO_MODEL = os.getenv("KOKORO_MODEL", "kokoro-v1.0.int8.onnx")
+# "auto" picks the fastest weights actually present (see _resolve_model_path).
+# Pin it to kokoro-v1.0.int8.onnx on a memory-constrained host.
+KOKORO_MODEL = os.getenv("KOKORO_MODEL", "auto")
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "voices-v1.0.bin")
 # hf_alpha = Hindi female → Indian-accented English. lang="en-us" keeps English
 # pronunciation correct while the speaker embedding supplies the Indian accent.
@@ -45,12 +53,35 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")  # tiny|base|small ...
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8")
 WHISPER_LANG = os.getenv("WHISPER_LANG", "en")
 
-CACHE_DIR = Path(os.getenv("TTS_CACHE_DIR", "/tmp/tts-cache"))
+# ONNX Runtime intra-op threads. Kokoro is a small model: throughput peaks
+# around 4 threads and *regresses* past that (measured RTF on a 12-core CPU:
+# 1 thread 3.1, 4 threads 0.42, 12 threads 0.60), because the per-op sync cost
+# outweighs the extra parallelism. 0/unset → pick a sane value for this host.
+ONNX_THREADS = int(os.getenv("ONNX_THREADS", "0")) or max(1, min(4, os.cpu_count() or 1))
+
+# Default next to the app (not /tmp, which isn't a real path on Windows) so the
+# cache survives restarts. Docker/Render override it with TTS_CACHE_DIR.
+CACHE_DIR = Path(os.getenv("TTS_CACHE_DIR", str(APP_DIR / "tts-cache")))
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
+
+# Pre-synthesize the knowledge base at boot (background thread). This is what
+# makes the site feel instant; turn it off (PREWARM=0) only on a host too small
+# to hold the models. WARMUP=1 is honoured as the older name for the same flag.
+PREWARM = os.getenv("PREWARM", os.getenv("WARMUP", "1")) != "0"
+# Also load Whisper at boot. Costs ~200 MB resident but takes the model load
+# off the first mic press.
+PREWARM_STT = os.getenv("PREWARM_STT", "1") != "0"
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="SIA Voice Service", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _start_prewarm()
+    yield
+
+
+app = FastAPI(title="SIA Voice Service", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS or ["*"],
@@ -81,61 +112,119 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # --- lazy model singletons ---------------------------------------------------
 _kokoro = None
 _whisper = None
+_kokoro_lock = threading.Lock()
+_whisper_lock = threading.Lock()
+
+# Fastest first. The fp32 weights are ~2x faster than the int8 ones on CPU
+# (RTF 0.42 vs 0.86 measured) — ONNX Runtime's dynamically-quantized MatMul
+# kernels are slower than plain fp32 GEMM here — but cost ~325 MB instead of
+# ~92 MB resident. The Docker image only bakes int8, so containers stay lean;
+# a local checkout that has both automatically gets the fast one.
+_MODEL_PREFERENCE = ("kokoro-v1.0.onnx", "kokoro-v1.0.fp16.onnx", "kokoro-v1.0.int8.onnx")
 
 
 def _resolve_model_path() -> str:
-    """Use the configured model if present, else whichever Kokoro model the
-    image actually has (build-time download may have used a fallback)."""
-    if Path(KOKORO_MODEL).exists():
-        return KOKORO_MODEL
-    for candidate in ("kokoro-v1.0.int8.onnx", "kokoro-v1.0.fp16.onnx", "kokoro-v1.0.onnx"):
-        if Path(candidate).exists():
-            return candidate
-    return KOKORO_MODEL  # let Kokoro raise a clear error
+    """Path to the Kokoro weights to load.
+
+    An explicit KOKORO_MODEL wins if that file exists; otherwise fall back to
+    the fastest of the weights this checkout/image actually has.
+    """
+    if KOKORO_MODEL != "auto":
+        for base in (Path(KOKORO_MODEL), APP_DIR / KOKORO_MODEL):
+            if base.exists():
+                return str(base)
+    for candidate in _MODEL_PREFERENCE:
+        path = APP_DIR / candidate
+        if path.exists():
+            return str(path)
+    # Nothing on disk — let Kokoro raise a clear "file not found" for the
+    # configured name rather than failing somewhere more confusing.
+    return KOKORO_MODEL if KOKORO_MODEL != "auto" else _MODEL_PREFERENCE[-1]
+
+
+def _voices_path() -> str:
+    path = Path(KOKORO_VOICES)
+    return str(path if path.exists() else APP_DIR / KOKORO_VOICES)
 
 
 def get_kokoro():
+    """Kokoro on a hand-tuned ONNX Runtime session (see ONNX_THREADS)."""
     global _kokoro
     if _kokoro is None:
-        from kokoro_onnx import Kokoro
+        with _kokoro_lock:
+            if _kokoro is None:
+                import onnxruntime as ort
+                from kokoro_onnx import Kokoro
 
-        _kokoro = Kokoro(_resolve_model_path(), KOKORO_VOICES)
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = ONNX_THREADS
+                opts.inter_op_num_threads = 1
+                opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                model_path = _resolve_model_path()
+                session = ort.InferenceSession(
+                    model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+                )
+                print(f"[tts] {Path(model_path).name} on {ONNX_THREADS} thread(s)")
+                _kokoro = Kokoro.from_session(session, _voices_path())
     return _kokoro
 
 
 def get_whisper():
     global _whisper
     if _whisper is None:
-        from faster_whisper import WhisperModel
+        with _whisper_lock:
+            if _whisper is None:
+                from faster_whisper import WhisperModel
 
-        _whisper = WhisperModel(
-            WHISPER_MODEL,
-            device="cpu",
-            compute_type=WHISPER_COMPUTE,
-            cpu_threads=int(os.getenv("CPU_THREADS", "1")),  # keep memory/threads low
-        )
+                _whisper = WhisperModel(
+                    WHISPER_MODEL,
+                    device="cpu",
+                    compute_type=WHISPER_COMPUTE,
+                    cpu_threads=int(os.getenv("CPU_THREADS", str(ONNX_THREADS))),
+                )
+                print(f"[stt] faster-whisper '{WHISPER_MODEL}' ({WHISPER_COMPUTE})")
     return _whisper
 
 
-@app.on_event("startup")
-def _warmup() -> None:
-    """Optionally load both models right after boot (WARMUP=1) on an always-on
-    instance, so the first user request isn't a ~60s cold model load. Runs in a
-    background thread so it never blocks the health check."""
-    if os.getenv("WARMUP", "0") != "1":
-        return
+# --- startup prewarm ---------------------------------------------------------
+# Progress is exposed on /health so you can tell "still warming" apart from
+# "broken" without reading the logs.
+_prewarm_status = {"enabled": PREWARM, "done": 0, "total": 0, "ready": not PREWARM, "error": None}
 
-    import threading
 
-    def load() -> None:
-        try:
-            get_kokoro()
+def _prewarm_worker() -> None:
+    texts = spoken_texts()
+    _prewarm_status["total"] = len(texts)
+    started = time.perf_counter()
+    try:
+        for text in texts:
+            _cached_wav(text, TTS_VOICE, TTS_LANG, TTS_SPEED)
+            _prewarm_status["done"] += 1
+        if PREWARM_STT:
             get_whisper()
-            print("[warmup] models loaded")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[warmup] failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 - never take the service down
+        _prewarm_status["error"] = str(exc)
+        print(f"[prewarm] failed: {exc}")
+        return
+    _prewarm_status["ready"] = True
+    # Keep log output ASCII: a Windows console defaults to cp1252 and raises
+    # UnicodeEncodeError on anything fancier.
+    print(
+        f"[prewarm] {_prewarm_status['done']}/{len(texts)} clips cached "
+        f"in {time.perf_counter() - started:.1f}s -> {CACHE_DIR}"
+    )
 
-    threading.Thread(target=load, daemon=True).start()
+
+def _start_prewarm() -> None:
+    """Synthesize every knowledge-base answer into the disk cache at boot.
+
+    Runs in a daemon thread so it never blocks the health check or the first
+    request — an uncached request just synthesizes on demand as before.
+    """
+    if not PREWARM:
+        return
+    threading.Thread(target=_prewarm_worker, name="prewarm", daemon=True).start()
 
 
 class TtsRequest(BaseModel):
@@ -156,13 +245,36 @@ def _synth_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
     return buf.getvalue()
 
 
+def _cached_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
+    """WAV bytes for this exact request, synthesizing only on a cache miss.
+
+    Shared by /tts and the startup prewarm so both write the same cache keys —
+    that's what makes a prewarmed answer a pure disk read at request time.
+    """
+    key = hashlib.sha256(f"{voice}|{lang}|{speed}|{text}".encode("utf-8")).hexdigest()
+    path = CACHE_DIR / f"{key}.wav"
+    if path.exists():
+        return path.read_bytes()
+
+    data = _synth_wav(text, voice, lang, speed)
+    # Write via a temp file + rename so a concurrent reader never sees a
+    # half-written clip (two requests for the same text can race here).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.part")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    return data
+
+
 @app.get("/health")
 def health():
     return {
         "ok": True,
         "tts_voice": TTS_VOICE,
         "tts_lang": TTS_LANG,
+        "tts_model": Path(_resolve_model_path()).name,
+        "onnx_threads": ONNX_THREADS,
         "whisper_model": WHISPER_MODEL,
+        "prewarm": dict(_prewarm_status),
     }
 
 
@@ -196,17 +308,10 @@ def tts(req: TtsRequest):
     lang = req.lang or TTS_LANG
     speed = req.speed or TTS_SPEED
 
-    key = hashlib.sha256(f"{voice}|{lang}|{speed}|{text}".encode("utf-8")).hexdigest()
-    path = CACHE_DIR / f"{key}.wav"
-
-    if path.exists():
-        data = path.read_bytes()
-    else:
-        try:
-            data = _synth_wav(text, voice, lang, speed)
-        except Exception as exc:  # noqa: BLE001 - surface a clean 500 to the client
-            raise HTTPException(status_code=500, detail=f"tts failed: {exc}") from exc
-        path.write_bytes(data)
+    try:
+        data = _cached_wav(text, voice, lang, speed)
+    except Exception as exc:  # noqa: BLE001 - surface a clean 500 to the client
+        raise HTTPException(status_code=500, detail=f"tts failed: {exc}") from exc
 
     return Response(
         content=data,
@@ -215,13 +320,8 @@ def tts(req: TtsRequest):
     )
 
 
-@app.post("/stt")
-async def stt(audio: UploadFile = File(...)):
-    raw = await audio.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="empty audio upload")
-
-    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+def _transcribe(raw: bytes, suffix: str) -> str:
+    """Blocking transcription — always call this off the event loop."""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -233,17 +333,30 @@ async def stt(audio: UploadFile = File(...)):
             language=WHISPER_LANG,
             beam_size=1,
             vad_filter=True,  # drop silence → fewer hallucinated words
+            condition_on_previous_text=False,  # short clips: no context to carry
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"stt failed: {exc}") from exc
+        return " ".join(seg.text.strip() for seg in segments).strip()
     finally:
         if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+@app.post("/stt")
+async def stt(audio: UploadFile = File(...)):
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty audio upload")
+
+    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+    try:
+        # Whisper is CPU-bound and synchronous; running it inline in this async
+        # handler would block the event loop (and every other request) for the
+        # length of the transcription.
+        text = await run_in_threadpool(_transcribe, raw, suffix)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"stt failed: {exc}") from exc
 
     return {"text": text}
