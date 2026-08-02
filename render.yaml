@@ -35,6 +35,19 @@ services:
       # isn't waiting on a model load. Set "0" on a 512 MB instance.
       - key: PREWARM_STT
         value: "1"
+      # --- Knowledge base -------------------------------------------------
+      # Grounded answering runs locally (Qwen2.5-1.5B on llama.cpp): no API key
+      # and no per-request cost, but ~1 GB resident on top of the voice models.
+      # Total footprint is ~1.5 GB, so `standard` (2 GB) is the smallest plan
+      # that fits. Set KB_ENABLED=0 to drop it and serve the curated answers.
+      - key: LLM_BACKEND
+        value: local
+      - key: KB_ENABLED
+        value: "1"
+      # bge-small-en-v1.5 is trained for question-to-passage search and measured
+      # better recall than all-MiniLM-L6-v2 (47% vs 33%) on the eval set.
+      - key: EMBED_MODEL
+        value: bge
       # Lock this down to your site's origin(s) in production, comma-separated,
       # e.g. "https://your-site.vercel.app". "*" is fine while developing.
       - key: ALLOW_ORIGINS

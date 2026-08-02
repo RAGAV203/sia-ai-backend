@@ -7,15 +7,23 @@ all open source, no paid APIs.
 | Endpoint | Method | In | Out |
 |----------|--------|----|-----|
 | `/tts`   | POST   | `{ "text": "..." }` (JSON) | `audio/wav` |
+| `/tts/stream` | POST | `{ "text": "..." }` (JSON) | length-prefixed WAV clips, one per sentence |
 | `/stt`   | POST   | `audio` file (multipart)   | `{ "text": "..." }` |
-| `/ask`   | POST   | `{ "question": "..." }` (JSON) | `{ "answer": "..." }` |
+| `/ask`   | POST   | `{ "question": "..." }` (JSON) | `{ "answer": "...", "grounded": true, "sources": [...] }` |
 | `/content`| GET   | –  | `{ "greeting": "...", "suggestions": [...] }` |
 | `/health`| GET    | –  | status JSON |
 | `/voices`| GET    | –  | list of Kokoro voice ids (confirm `hf_alpha`) |
 
-The **knowledge base and answering logic** live in [`knowledge.py`](./knowledge.py)
-— edit the greeting, chips, and answers there and redeploy; no frontend rebuild
-needed.
+`/ask` answers open-ended questions from the **scraped college website**, grounded
+in retrieved sources and defended against prompt injection — see
+[`kb/README.md`](./kb/README.md) for the retrieval design and the security model.
+Without an `ANTHROPIC_API_KEY` (or with `KB_ENABLED=0`) it falls back to the
+curated answers in [`knowledge.py`](./knowledge.py), whose clips are prewarmed.
+
+`/tts/stream` exists because whole-answer synthesis is the wrong shape for a
+voice UI: Kokoro runs below real time, so a long answer means several seconds of
+silence first. Streaming per sentence measured **2x faster to first audio** and
+stays gapless. The frontend prefers it and falls back to `/tts`.
 
 - **TTS** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) via
   [`kokoro-onnx`](https://github.com/thewh1teagle/kokoro-onnx) (ONNX Runtime, no

@@ -10,3 +10,18 @@ numpy>=1.26,<2.3
 
 # --- STT: faster-whisper (CTranslate2) ---
 faster-whisper>=1.0
+
+# --- Knowledge base: grounded answering over the scraped college site ---
+# No vector DB and no PyTorch. Embeddings run on the ONNX Runtime that Kokoro
+# already loads (kb/embed.py), retrieval is a NumPy matmul over ~500 chunks
+# (kb/index.py), and BM25 is implemented inline — see kb/index.py for why.
+selectolax>=0.3.21          # fast, lenient HTML parsing for scrape + sanitization
+
+# Local grounded answering (default backend) — Qwen2.5-1.5B-Instruct on CPU.
+# No API key and no network at request time. On Windows install the prebuilt
+# wheel, since the source build trips the MAX_PATH limit in vendored llama.cpp:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python>=0.3.0
+
+# Optional: only needed with LLM_BACKEND=anthropic
+anthropic>=0.40

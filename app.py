@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -29,13 +30,25 @@ from typing import Optional
 import soundfile as sf
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from knowledge import GREETING, public_suggestions, resolve_answer, spoken_texts
+from speech import split_sentences
+
+from knowledge import (
+    FALLBACK_ANSWER as KEYWORD_FALLBACK,
+    GREETING,
+    public_suggestions,
+    resolve_answer,
+    spoken_texts,
+)
 
 APP_DIR = Path(__file__).resolve().parent
+
+# The scraped knowledge base is optional: without it (or without an API key) the
+# service still answers from the curated keyword set, whose clips are prewarmed.
+KB_ENABLED = os.getenv("KB_ENABLED", "1") != "0"
 
 # --- configuration (all overridable via environment variables) ---------------
 # "auto" picks the fastest weights actually present (see _resolve_model_path).
@@ -75,8 +88,28 @@ PREWARM_STT = os.getenv("PREWARM_STT", "1") != "0"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+_rate_limiter = None
+_answer_cache = None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _rate_limiter, _answer_cache
+
+    from kb.guard import RateLimiter
+
+    _rate_limiter = RateLimiter()
+    if KB_ENABLED:
+        try:
+            from kb.answer_cache import AnswerCache
+            from kb.index import load as load_index
+
+            index = load_index()
+            print(f"[kb] index: {len(index.chunks) if index else 0} chunks")
+            _answer_cache = AnswerCache()
+        except Exception as exc:  # noqa: BLE001 - never block startup on the KB
+            print(f"[kb] disabled: {type(exc).__name__}: {exc}")
+
     _start_prewarm()
     yield
 
@@ -88,6 +121,61 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Response bodies worth reading back: JSON and text. Audio and the TTS stream
+# are logged by size only — dumping WAV bytes into the trace is unreadable, and
+# buffering the stream to log it would re-create the very latency /tts/stream
+# exists to remove.
+_TRACE_BODY_TYPES = ("application/json", "text/", "application/problem+json")
+_TRACE_BODY_LIMIT = 2000
+
+
+@app.middleware("http")
+async def _trace_requests(request: Request, call_next):
+    """One line per request when DEBUG=1, plus the response it returned.
+
+    The per-model traces below cover what each model saw; this covers what the
+    *client* asked for and what it got back, which is what you need when the UI
+    misbehaves and the question is whether the request even arrived — and, when
+    it did, whether the payload was what the UI expected. A 200 carrying
+    ``{"text": ""}`` and a 200 carrying a real transcript are the same line
+    without the body, and they mean completely different things.
+    """
+    from kb import debug
+
+    if not debug.ENABLED:
+        return await call_next(request)
+
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed = (time.perf_counter() - started) * 1000
+    client = request.client.host if request.client else "?"
+    debug.log(
+        f"[http] {request.method} {request.url.path} -> {response.status_code} "
+        f"{elapsed:.0f} ms  from {client}"
+    )
+
+    ctype = response.headers.get("content-type", "")
+    if not any(ctype.startswith(t) for t in _TRACE_BODY_TYPES):
+        size = response.headers.get("content-length")
+        debug.log(f"[http] <- {ctype or 'no content-type'} {size + ' bytes' if size else '(streamed)'}")
+        return response
+
+    # Draining body_iterator consumes it, so the response has to be rebuilt from
+    # the bytes we read — returning the original would send an empty body.
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    text = body.decode("utf-8", "replace")
+    if len(text) > _TRACE_BODY_LIMIT:
+        text = f"{text[:_TRACE_BODY_LIMIT]}... [{len(text) - _TRACE_BODY_LIMIT} more chars]"
+    debug.log(f"[http] <- {text}")
+
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.media_type,
+    )
 
 
 def _cors_origin(request: Request) -> str:
@@ -193,6 +281,42 @@ def get_whisper():
 _prewarm_status = {"enabled": PREWARM, "done": 0, "total": 0, "ready": not PREWARM, "error": None}
 
 
+def _prewarm_answers() -> None:
+    """Pre-answer the suggestion chips and cache both the text and its audio.
+
+    A local model needs several seconds for a novel question (prefill dominates),
+    which is fine for the long tail but not for the buttons on screen. Answering
+    them at boot puts them in the semantic cache, so a tap is served from cache
+    and its clips are already synthesized — the same trick the fixed knowledge
+    base used, extended to generated answers.
+    """
+    if not (_answer_cache and KB_ENABLED):
+        return
+    from kb import answering
+
+    if not answering.available():
+        return
+    if answering.backend_name() == "local":
+        # Prime the KV cache with the real system prompt before the first
+        # question, so it does not pay ~3s of prefill the cache would have saved.
+        from kb import llm_local
+
+        llm_local.warm()
+    for suggestion in public_suggestions():
+        question = suggestion["question"]
+        if _answer_cache.get(question):
+            continue
+        try:
+            result = answering.answer(question)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[prewarm] answer failed for {question[:40]!r}: {exc}")
+            continue
+        if result.get("grounded"):
+            _answer_cache.put(question, result, top_chunk_id=result.get("top_chunk_id"))
+            for sentence in split_sentences(result["answer"]):
+                _cached_wav(sentence, TTS_VOICE, TTS_LANG, TTS_SPEED)
+
+
 def _prewarm_worker() -> None:
     texts = spoken_texts()
     _prewarm_status["total"] = len(texts)
@@ -201,6 +325,7 @@ def _prewarm_worker() -> None:
         for text in texts:
             _cached_wav(text, TTS_VOICE, TTS_LANG, TTS_SPEED)
             _prewarm_status["done"] += 1
+        _prewarm_answers()
         if PREWARM_STT:
             get_whisper()
     except Exception as exc:  # noqa: BLE001 - never take the service down
@@ -251,12 +376,24 @@ def _cached_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
     Shared by /tts and the startup prewarm so both write the same cache keys —
     that's what makes a prewarmed answer a pure disk read at request time.
     """
+    from kb import debug
+
     key = hashlib.sha256(f"{voice}|{lang}|{speed}|{text}".encode("utf-8")).hexdigest()
     path = CACHE_DIR / f"{key}.wav"
     if path.exists():
+        if debug.ENABLED:
+            debug.log(f"[tts] cache HIT  {len(text):4d} ch  {key[:8]}  {text[:60]!r}")
         return path.read_bytes()
 
+    started = time.perf_counter()
     data = _synth_wav(text, voice, lang, speed)
+    if debug.ENABLED:
+        seconds = (len(data) - 44) / (24000 * 2)
+        elapsed = time.perf_counter() - started
+        debug.log(
+            f"[tts] SYNTH {len(text):4d} ch -> {seconds:5.2f}s audio in {elapsed:5.2f}s "
+            f"(RTF {elapsed / max(seconds, 0.01):.2f}) voice={voice} {text[:50]!r}"
+        )
     # Write via a temp file + rename so a concurrent reader never sees a
     # half-written clip (two requests for the same text can race here).
     tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.part")
@@ -275,7 +412,37 @@ def health():
         "onnx_threads": ONNX_THREADS,
         "whisper_model": WHISPER_MODEL,
         "prewarm": dict(_prewarm_status),
+        "knowledge_base": _kb_status(),
     }
+
+
+def _kb_status() -> dict:
+    """What the answering path can actually do right now."""
+    if not KB_ENABLED:
+        return {"enabled": False}
+    try:
+        from kb import answering
+        from kb.index import load as load_index
+
+        index = load_index()
+        status = {
+            "enabled": True,
+            "chunks": len(index.chunks) if index else 0,
+            "backend": answering.backend_name(),
+            "ready": answering.available(),
+            "top_k": answering.TOP_K,
+            "answer_cache": _answer_cache.stats() if _answer_cache else None,
+        }
+        if answering.backend_name() == "local":
+            from kb import llm_local
+
+            status["model"] = llm_local.MODEL_PATH.name
+            status["threads"] = llm_local.N_THREADS
+        else:
+            status["model"] = answering.MODEL
+        return status
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
 
 
 @app.get("/voices")
@@ -291,11 +458,80 @@ def content():
 
 
 @app.post("/ask")
-def ask(req: AskRequest):
-    question = (req.question or "").strip()
-    if not question:
+def ask(req: AskRequest, request: Request):
+    """Answer a question, grounded in the scraped college knowledge base.
+
+    Degrades in stages rather than failing: knowledge base -> curated keyword
+    answers -> a safe fallback line. The avatar always gets something to say.
+    """
+    if not (req.question or "").strip():
         raise HTTPException(status_code=400, detail="`question` is required")
-    return {"answer": resolve_answer(question)}
+
+    client = request.client.host if request.client else "unknown"
+    if not _rate_limiter.allow(client):
+        raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
+
+    from kb.guard import check_question
+
+    verdict = check_question(req.question)
+    if not verdict.ok:
+        if verdict.reason == "prompt_extraction":
+            # Refuse rather than sanitize-and-answer: honouring a rewritten
+            # instruction is exactly the outcome being defended against.
+            from kb.prompts import OFF_CONTRACT_ANSWER
+
+            return {"answer": OFF_CONTRACT_ANSWER, "grounded": False, "reason": "refused"}
+        raise HTTPException(status_code=400, detail=f"invalid question ({verdict.reason})")
+
+    question = verdict.value
+
+    # Social turns are answered before anything else runs. The corpus cannot
+    # answer "thanks" — there is no right chunk to retrieve — so retrieving
+    # anyway returns whichever page is nearest and speaks it as fact. See
+    # kb/intent.py for the testimonial this used to read out.
+    from kb import intent
+
+    social = intent.match(question)
+    if social:
+        name, reply = social
+        from kb import debug
+
+        debug.section(f"ASK: {question}")
+        debug.log(f"intent={name} -> canned reply (no retrieval, no generation)")
+        return {"answer": reply, "grounded": True, "reason": f"intent:{name}"}
+
+    if not KB_ENABLED:
+        return {"answer": resolve_answer(question), "grounded": True, "reason": "keyword_kb"}
+
+    from kb import answering
+
+    if _answer_cache:
+        # The top retrieved chunk corroborates a merely-similar question, so a
+        # paraphrase can reuse the cached answer without loosening the
+        # similarity bar. Cheap: retrieval is a few milliseconds.
+        cached = _answer_cache.get(question, top_chunk_id=answering.top_chunk_id(question))
+        if cached:
+            from kb import debug
+
+            debug.section(f"ASK: {question}")
+            debug.log(
+                f"answer cache HIT ({cached.get('match')}, sim={cached.get('similarity')}) "
+                f"-> {cached.get('matched_question', '')[:60]!r}"
+            )
+            debug.block("CACHED ANSWER", cached.get("answer", ""))
+            # Byte-identical to a previous answer, so its clips are already on disk.
+            return cached
+
+    result = answering.answer(question)
+    if result["reason"] in ("no_api_key", "no_sources", "model_error"):
+        # Fall back to the curated answers, whose audio is prewarmed.
+        curated = resolve_answer(question)
+        if curated != KEYWORD_FALLBACK:
+            return {"answer": curated, "grounded": True, "reason": f"keyword_kb:{result['reason']}"}
+
+    if _answer_cache:
+        _answer_cache.put(question, result, top_chunk_id=result.get("top_chunk_id"))
+    return result
 
 
 @app.post("/tts")
@@ -322,26 +558,94 @@ def tts(req: TtsRequest):
 
 def _transcribe(raw: bytes, suffix: str) -> str:
     """Blocking transcription — always call this off the event loop."""
+    from kb import debug
+
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(raw)
             tmp_path = tmp.name
 
-        segments, _info = get_whisper().transcribe(
+        started = time.perf_counter()
+        segments, info = get_whisper().transcribe(
             tmp_path,
             language=WHISPER_LANG,
             beam_size=1,
             vad_filter=True,  # drop silence → fewer hallucinated words
             condition_on_previous_text=False,  # short clips: no context to carry
         )
-        return " ".join(seg.text.strip() for seg in segments).strip()
+        # faster-whisper yields lazily, so nothing is decoded until this runs.
+        parts = [seg for seg in segments]
+        text = " ".join(seg.text.strip() for seg in parts).strip()
+
+        if debug.ENABLED:
+            debug.section("STT")
+            debug.log(
+                f"upload {len(raw) / 1024:.0f} KB ({suffix}) -> "
+                f"{getattr(info, 'duration', 0):.1f}s audio, "
+                f"lang={getattr(info, 'language', '?')} "
+                f"({getattr(info, 'language_probability', 0):.2f})"
+            )
+            for i, seg in enumerate(parts, 1):
+                debug.log(f"  seg {i} [{seg.start:5.2f}-{seg.end:5.2f}s] {seg.text.strip()!r}")
+            debug.log(f"model={WHISPER_MODEL}/{WHISPER_COMPUTE} in {(time.perf_counter() - started) * 1000:.0f} ms")
+            debug.block("TRANSCRIPT", text or "(empty)")
+        return text
     finally:
         if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+@app.post("/tts/stream")
+def tts_stream(req: TtsRequest):
+    """Synthesize sentence by sentence and stream each clip as it is ready.
+
+    Whole-answer synthesis is the wrong shape for a voice UI: Kokoro runs at
+    ~0.4x real time, so a 40-second answer means ~16 seconds of silence first.
+    Sentence streaming turns that into ~2 seconds — the listener hears sentence
+    one while sentence two renders, and because the real-time factor is below 1,
+    synthesis stays ahead of playback for the rest of the answer.
+
+    Wire format is a sequence of ``[4-byte big-endian length][WAV bytes]``
+    frames. Each frame is a complete WAV file so the browser can hand it
+    straight to ``decodeAudioData`` without reassembling anything.
+
+    Each sentence is cached individually, so stock phrasings ("Is there
+    anything else I can help with?") are already on disk across different
+    answers — a finer-grained hit than the whole-answer cache can give.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="`text` is required")
+
+    voice = req.voice or TTS_VOICE
+    lang = req.lang or TTS_LANG
+    speed = req.speed or TTS_SPEED
+    sentences = split_sentences(text)
+
+    def frames():
+        for sentence in sentences:
+            try:
+                wav = _cached_wav(sentence, voice, lang, speed)
+            except Exception as exc:  # noqa: BLE001 - one bad clip must not kill the stream
+                print(f"[tts/stream] sentence failed ({exc}); skipping")
+                continue
+            yield struct.pack(">I", len(wav)) + wav
+
+    return StreamingResponse(
+        frames(),
+        media_type="application/octet-stream",
+        headers={
+            "X-Sentence-Count": str(len(sentences)),
+            "Cache-Control": "no-store",
+            # Without this an intermediate proxy may buffer the whole response
+            # and re-create exactly the delay this endpoint exists to remove.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/stt")

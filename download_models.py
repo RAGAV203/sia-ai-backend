@@ -54,7 +54,46 @@ def main() -> None:
     from faster_whisper import WhisperModel
 
     WhisperModel(model, device="cpu", compute_type=compute)
+
+    _download_kb_models()
     print("[done] all models cached")
+
+
+# Knowledge-base models. Both are small and CPU-only: embeddings run on the same
+# ONNX Runtime as Kokoro, and generation runs on llama.cpp. Skipped when
+# KB_ENABLED=0 so a TTS/STT-only deployment stays lean.
+_HF_FILES = [
+    ("Xenova/all-MiniLM-L6-v2", "onnx/model_quantized.onnx", "models/minilm/model.onnx"),
+    ("Xenova/all-MiniLM-L6-v2", "tokenizer.json", "models/minilm/tokenizer.json"),
+    (
+        os.getenv("LLM_REPO", "bartowski/Qwen2.5-1.5B-Instruct-GGUF"),
+        os.getenv("LLM_FILE", "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"),
+        "models/llm/qwen2.5-1.5b.gguf",
+    ),
+]
+
+
+def _download_kb_models() -> None:
+    if os.getenv("KB_ENABLED", "1") == "0":
+        print("[skip] knowledge-base models (KB_ENABLED=0)")
+        return
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    for repo, filename, dest in _HF_FILES:
+        path = Path(dest)
+        if path.exists() and path.stat().st_size > 0:
+            print(f"[skip] {dest} already present")
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[get ] {dest} <- {repo}/{filename}")
+        try:
+            cached = hf_hub_download(repo_id=repo, filename=filename)
+            shutil.copyfile(cached, path)
+            print(f"[done] {dest} ({path.stat().st_size / 1e6:.0f} MB)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] {dest} failed: {exc}")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,26 @@
 __pycache__/
 *.pyc
-*.wav
-tts-cache/
 .venv/
 venv/
+
+# Audio artifacts and caches — regenerated at runtime.
+*.wav
+tts-cache/
+
+# Model weights are downloaded inside the image by download_models.py, not
+# copied from the build context (they are large and often absent locally).
 *.onnx
 *.bin
+*.gguf
+models/
+
+# Scraped HTML is only an iteration cache for re-running extraction locally;
+# the image needs corpus.jsonl, which is NOT excluded so it can be baked in.
+kb-data/html-cache/
+kb-data/vectors.npy
+kb-data/chunks.jsonl
+kb-data/answer-cache.jsonl
+
+.git/
+.github/
+tests/__pycache__/

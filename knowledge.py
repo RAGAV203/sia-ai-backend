@@ -129,4 +129,20 @@ def spoken_texts() -> List[str]:
     these at startup — after that every ``/tts`` call the site makes is a disk
     cache hit and the avatar starts talking immediately.
     """
-    return [GREETING] + [s["answer"] for s in SUGGESTIONS] + [FALLBACK_ANSWER]
+    texts = [GREETING] + [s["answer"] for s in SUGGESTIONS] + [FALLBACK_ANSWER]
+
+    # The generated-answer path has two fixed strings of its own: the canonical
+    # "I can't answer that" sentence the model is told to emit, and the
+    # off-contract reply. Both are said often enough — and are constant enough —
+    # to be worth prewarming alongside the curated set.
+    try:
+        from kb.intent import replies as intent_replies
+        from kb.prompts import NO_ANSWER_SENTENCE, OFF_CONTRACT_ANSWER
+
+        # Social turns ("thanks", "how are you") are answered from a fixed set
+        # too, and are asked often enough to be worth having on disk.
+        texts += [NO_ANSWER_SENTENCE, OFF_CONTRACT_ANSWER] + intent_replies()
+    except ImportError:
+        pass  # knowledge base not installed; the curated set still works
+
+    return texts

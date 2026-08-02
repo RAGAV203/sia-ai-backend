@@ -21,3 +21,13 @@ tts-cache/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Knowledge base artifacts. The derived index and caches are rebuilt with
+# `python -m kb.index`, but corpus.jsonl is the scrape output and IS committed:
+# it takes ~40 minutes to regenerate against the live site, and the Docker build
+# bakes the index from it rather than crawling during a build.
+kb-data/
+!kb-data/corpus.jsonl
+models/
+
+debug.log
