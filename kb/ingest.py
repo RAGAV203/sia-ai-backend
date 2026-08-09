@@ -34,7 +34,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .sanitize import clean_text, html_to_text, injection_signals, page_html_to_text
+from .sanitize import (
+    clean_text,
+    extract_directory,
+    html_to_text,
+    injection_signals,
+    page_html_to_text,
+)
 
 SITE = "https://shasuncollege.edu.in"
 API = f"{SITE}/wp-json/wp/v2"
@@ -236,6 +242,7 @@ def fetch_html(urls: Iterable[str], *, refetch: bool = False) -> list[Doc]:
     urls = list(urls)
     raw: dict[str, str] = {}
     titles: dict[str, str] = {}
+    directory: list[str] = []
     fetched = 0
     for i, url in enumerate(urls, 1):
         cached = not refetch and _cache_path(url).exists()
@@ -244,6 +251,12 @@ def fetch_html(urls: Iterable[str], *, refetch: bool = False) -> list[Doc]:
             continue
         raw[url] = page_html_to_text(html)
         titles[url] = _title(html)
+        # The staff directory is stamped identically into every page, so the
+        # first page carrying it supplies the whole thing and the rest are
+        # ignored. Taking the largest keeps a page that happens to render a
+        # partial list from winning.
+        if len(entries := extract_directory(html)) > len(directory):
+            directory = entries
         if i % 25 == 0:
             print(f"  html {i}/{len(urls)} ({fetched} fetched, {i - fetched} cached)...")
         if not cached:
@@ -251,7 +264,7 @@ def fetch_html(urls: Iterable[str], *, refetch: bool = False) -> list[Doc]:
             time.sleep(0.15)  # be a polite guest on someone else's server
 
     cleaned = _drop_residual_chrome(raw)
-    return [
+    docs = [
         Doc(
             id="html-" + (urllib.parse.urlparse(url).path.strip("/").replace("/", "-") or "root"),
             url=url,
@@ -262,6 +275,21 @@ def fetch_html(urls: Iterable[str], *, refetch: bool = False) -> list[Doc]:
         )
         for url, text in cleaned.items()
     ]
+
+    if directory:
+        print(f"  faculty directory: {len(directory)} entries lifted out of the popup markup")
+        docs.append(
+            Doc(
+                id="directory-faculty",
+                url=f"{SITE}/faculty/",
+                title="Faculty and Staff Directory",
+                text="Faculty and staff of Shasun Jain College for Women.\n"
+                + "\n".join(directory),
+                source="directory",
+                kind="faculty",
+            )
+        )
+    return docs
 
 
 def _title(html: str) -> str:

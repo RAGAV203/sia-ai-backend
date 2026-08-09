@@ -1,16 +1,41 @@
-# Render Blueprint — deploys the SIA voice service (TTS + STT).
+# Render Blueprint — deploys the SIA voice service.
 # In the Render dashboard: New + → Blueprint → point at THIS repo.
+#
+# MEASURED resident memory (psutil RSS, int8 Kokoro, 1 ONNX thread):
+#
+#   python + fastapi + google-genai SDK                106 MB
+#   + retrieval index (704 chunks x 768d)              124 MB
+#   + MiniLM, the answer-cache encoder (local)         185 MB
+#   + Kokoro TTS int8 (local)                          323 MB   <- steady state
+#   + PyAV, needed to decode browser audio             336 MB
+#   + faster-whisper 'base' fallback                   478 MB   <- worst case
+#   + faster-whisper 'tiny' fallback                   447 MB
+#
+# So the service fits Render's 512 MB free tier at 323 MB steady state, but only
+# if the local Whisper fallback stays out of the process — loading it leaves
+# 34 MB of headroom, which will not survive a traffic spike. STT_FALLBACK=0
+# below drops it; Gemini still transcribes, and a Gemini outage degrades the mic
+# to the browser's own recognition rather than OOM-killing the container.
+#
+# Free tier still spins down when idle (~60 s cold start, and the TTS cache is
+# lost with the disk each time). `starter` avoids both for $7.
 services:
   - type: web
     name: sia-voice
     runtime: docker
     dockerfilePath: ./Dockerfile
-    # int8 model keeps RAM low. `standard` (2 GB) is comfortable; to fit the
-    # 512 MB tiers also set WHISPER_MODEL=tiny (see the RAM notes in README.md).
-    plan: standard
+    plan: starter
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      # --- required ---------------------------------------------------------
+      # Answering, embeddings and speech-to-text all authenticate with this.
+      # Set it in the dashboard; never commit it.
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # --- TTS (local) ------------------------------------------------------
+      # int8 keeps RAM low; the fp32 weights are ~2x faster but ~325 MB.
       - key: KOKORO_MODEL
         value: kokoro-v1.0.int8.onnx
       - key: TTS_VOICE
@@ -19,35 +44,55 @@ services:
         value: en-us
       - key: TTS_SPEED
         value: "0.9"
-      # tiny keeps RAM low so Kokoro + Whisper fit together; use `base` for
-      # better accuracy if you're on the 2 GB Standard plan.
+
+      # --- models -----------------------------------------------------------
+      # Chosen by measurement, not by tier — see kb/gemini.py for the table.
+      # Text and audio differ because the two price lists differ by modality.
+      - key: GEMINI_TEXT_MODEL
+        value: gemini-3.1-flash-lite
+      - key: GEMINI_AUDIO_MODEL
+        value: gemini-3.5-flash-lite
+      - key: GEMINI_EMBED_MODEL
+        value: gemini-embedding-001
+      - key: GEMINI_EMBED_DIM
+        value: "768"
+
+      # --- speech to text ---------------------------------------------------
+      # Gemini transcribes with the college vocabulary biased into the prompt.
+      # faster-whisper takes over automatically if the API is unreachable.
+      #
+      # On the 512 MB FREE tier set STT_FALLBACK=0 — the fallback costs 111-155
+      # MB and would leave too little headroom (see the table at the top).
+      - key: STT_BACKEND
+        value: gemini
+      - key: STT_FALLBACK
+        value: "1"
       - key: WHISPER_MODEL
         value: tiny
       - key: WHISPER_COMPUTE
         value: int8
-      # Pre-synthesize every knowledge-base answer into the disk cache at boot
-      # (background thread, ~2-3 min on int8) so every answer the site actually
-      # plays is served from disk in milliseconds. Set to "0" only if the
-      # instance is too small to hold the models.
+
+      # --- startup ----------------------------------------------------------
+      # Pre-synthesize every fixed answer into the disk cache at boot
+      # (background thread) so the clips the site actually plays are served from
+      # disk in milliseconds. Set to "0" only if the instance is too small.
       - key: PREWARM
         value: "1"
-      # Also load Whisper at boot (~200 MB resident) so the first mic press
-      # isn't waiting on a model load. Set "0" on a 512 MB instance.
+      # Loading the Whisper fallback at boot costs ~200 MB to speed up a path
+      # that only runs when Gemini is down. Off by default.
       - key: PREWARM_STT
-        value: "1"
-      # --- Knowledge base -------------------------------------------------
-      # Grounded answering runs locally (Qwen2.5-1.5B on llama.cpp): no API key
-      # and no per-request cost, but ~1 GB resident on top of the voice models.
-      # Total footprint is ~1.5 GB, so `standard` (2 GB) is the smallest plan
-      # that fits. Set KB_ENABLED=0 to drop it and serve the curated answers.
-      - key: LLM_BACKEND
-        value: local
+        value: "0"
+
+      # --- knowledge base ---------------------------------------------------
       - key: KB_ENABLED
         value: "1"
-      # bge-small-en-v1.5 is trained for question-to-passage search and measured
-      # better recall than all-MiniLM-L6-v2 (47% vs 33%) on the eval set.
-      - key: EMBED_MODEL
-        value: bge
+      - key: LLM_BACKEND
+        value: gemini
+      # The free embedding tier allows 100 texts/minute. Raise this on a paid
+      # key — it only exists to keep an index rebuild from being throttled.
+      - key: GEMINI_EMBED_RPM
+        value: "90"
+
       # Lock this down to your site's origin(s) in production, comma-separated,
       # e.g. "https://your-site.vercel.app". "*" is fine while developing.
       - key: ALLOW_ORIGINS

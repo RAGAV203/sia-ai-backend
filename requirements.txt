@@ -4,24 +4,28 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 
 # --- TTS: Kokoro-82M on ONNX Runtime (no PyTorch) ---
+# Synthesis stays local: it is CPU-only, free per request, cached to disk, and
+# a voice that is identical on every browser is the product.
 kokoro-onnx>=0.4.9
 soundfile>=0.12
 numpy>=1.26,<2.3
 
-# --- STT: faster-whisper (CTranslate2) ---
+# --- Gemini: answering, embeddings, and speech-to-text ---
+# One SDK covers all three. Replaces llama-cpp-python (~1 GB of local weights)
+# and the Anthropic client.
+google-genai>=2.17
+
+# --- STT fallback: faster-whisper (CTranslate2) ---
+# Only runs when Gemini is unreachable — no key, exhausted quota, or no network.
+# Also supplies PyAV, which decodes the browser's WebM/Opus and MP4/AAC uploads
+# into the WAV that the Gemini audio endpoint accepts. That decode is on the
+# primary path, so this stays a hard dependency rather than an optional one.
 faster-whisper>=1.0
 
-# --- Knowledge base: grounded answering over the scraped college site ---
-# No vector DB and no PyTorch. Embeddings run on the ONNX Runtime that Kokoro
-# already loads (kb/embed.py), retrieval is a NumPy matmul over ~500 chunks
-# (kb/index.py), and BM25 is implemented inline — see kb/index.py for why.
+# --- Knowledge base ---
+# No vector DB. Retrieval over ~700 chunks is a single NumPy matmul (kb/index.py)
+# and BM25 is implemented inline; a vector service would add a process, a network
+# hop and a backup story in exchange for nothing at this size.
 selectolax>=0.3.21          # fast, lenient HTML parsing for scrape + sanitization
-
-# Local grounded answering (default backend) — Qwen2.5-1.5B-Instruct on CPU.
-# No API key and no network at request time. On Windows install the prebuilt
-# wheel, since the source build trips the MAX_PATH limit in vendored llama.cpp:
-#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-llama-cpp-python>=0.3.0
-
-# Optional: only needed with LLM_BACKEND=anthropic
-anthropic>=0.40
+onnxruntime>=1.17           # the pinned local encoder behind the answer cache
+tokenizers>=0.15

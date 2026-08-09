@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import threading
 from collections import Counter
@@ -69,11 +70,40 @@ def tokenize(text: str) -> list[str]:
 
 # --- chunking -----------------------------------------------------------------
 
+def _split_at_word(text: str, limit: int) -> tuple[str, str]:
+    """Cut ``text`` at or before ``limit``, never through a word.
+
+    The old code sliced on raw character offsets, which is why retrieved chunks
+    read like ``'ills on aptitude, personality and social growth'`` and
+    ``'h 55% marks in the qualifying examination'``. A chunk beginning mid-word
+    is damaged twice over: the embedding is computed from a broken token
+    sequence, and if it is retrieved the model is asked to answer from a
+    fragment whose first sentence has no beginning.
+    """
+    if len(text) <= limit:
+        return text, ""
+    cut = text.rfind(" ", 0, limit + 1)
+    if cut <= 0:
+        cut = limit  # a single unbroken token longer than the window
+    return text[:cut].strip(), text[cut:].strip()
+
+
+def _tail_at_word(text: str, size: int) -> str:
+    """The last ``size``-ish characters of ``text``, starting at a word boundary."""
+    if len(text) <= size:
+        return text
+    tail = text[-size:]
+    space = tail.find(" ")
+    return tail[space + 1 :].strip() if space != -1 else tail.strip()
+
+
 def split_document(text: str) -> list[str]:
-    """Paragraph-aware windows of ~1000 chars with ~150 chars of overlap.
+    """Paragraph-aware windows of ~800 chars with ~120 chars of overlap.
 
     Splitting on blank lines first keeps related sentences together; the overlap
-    stops an answer that straddles a boundary from being cut in half.
+    stops an answer that straddles a boundary from being cut in half. Every cut
+    lands on a word boundary — see ``_split_at_word`` for why that matters more
+    than it sounds.
     """
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     chunks: list[str] = []
@@ -82,15 +112,19 @@ def split_document(text: str) -> list[str]:
     for para in paragraphs:
         # A single oversized paragraph (a long table or list) is hard-split.
         while len(para) > TARGET_CHARS * 2:
-            head, para = para[:TARGET_CHARS], para[TARGET_CHARS - OVERLAP_CHARS :]
+            head, rest = _split_at_word(para, TARGET_CHARS)
+            if not head:
+                break
             chunks.append(head)
+            para = f"{_tail_at_word(head, OVERLAP_CHARS)} {rest}".strip()
         if not buf:
             buf = para
         elif len(buf) + len(para) + 1 <= TARGET_CHARS:
             buf = f"{buf}\n{para}"
         else:
             chunks.append(buf)
-            buf = (buf[-OVERLAP_CHARS:] + "\n" + para) if len(buf) > OVERLAP_CHARS else para
+            overlap = _tail_at_word(buf, OVERLAP_CHARS)
+            buf = f"{overlap}\n{para}" if overlap else para
     if buf:
         chunks.append(buf)
 
@@ -117,6 +151,58 @@ def _chrome_lines(docs: list[dict]) -> set[str]:
     }
 
 
+def _strip_chrome(text: str, chrome: set[str]) -> str:
+    """Remove site chrome while keeping repeated *headings*.
+
+    Frequency alone cannot tell a menu item from a section heading: on this site
+    "Eligibility For Admission" appears on 27 programme pages and "Home" on 152,
+    and a naive frequency filter deletes both. Deleting the heading is what made
+    "Who can apply for admission?" unanswerable — the eligibility text survived,
+    but the one line saying what it *was* did not, so nothing in the chunk
+    matched the word "admission".
+
+    The two are distinguishable by shape rather than by count. A navigation menu
+    is a *run* of consecutive repeated lines; a section heading is a single
+    repeated line surrounded by prose unique to its page. So a chrome line is
+    only dropped when its neighbour is chrome too, which removes menus whole and
+    leaves headings standing.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    is_chrome = [ln in chrome for ln in lines]
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if is_chrome[i]:
+            prev_chrome = i > 0 and is_chrome[i - 1]
+            next_chrome = i + 1 < len(lines) and is_chrome[i + 1]
+            if prev_chrome or next_chrome:
+                continue  # part of a menu block
+        out.append(line)
+    return "\n".join(out)
+
+
+# A heading is short, has no sentence-ending punctuation, and introduces the
+# text under it. Carrying it into the embedding is what lets a chunk from deep
+# in a programme page still match "admission" or "career opportunities".
+HEADING_MAX_CHARS = 70
+
+
+def _looks_like_heading(line: str) -> bool:
+    line = line.strip()
+    if not line or len(line) > HEADING_MAX_CHARS:
+        return False
+    if line[-1] in ".!?,;:":
+        return False
+    return len(line.split()) <= 9
+
+
+def _section_for(lines: list[str], upto: int) -> str:
+    """The nearest heading at or above line ``upto``."""
+    for i in range(min(upto, len(lines) - 1), -1, -1):
+        if _looks_like_heading(lines[i]):
+            return lines[i].strip()
+    return ""
+
+
 def build_chunks() -> list[dict]:
     """Chunk every document, after subtracting site chrome corpus-wide.
 
@@ -131,27 +217,38 @@ def build_chunks() -> list[dict]:
     chunks: list[dict] = []
     dropped = 0
     for doc in docs:
-        body_text = "\n".join(
-            ln for ln in doc["text"].splitlines() if ln.strip() and ln.strip() not in chrome
-        )
+        body_text = _strip_chrome(doc["text"], chrome)
         if len(body_text) < 100:
             dropped += 1  # nothing but chrome — indexing it would only add noise
             continue
-        doc = {**doc, "text": body_text}
-        for i, body in enumerate(split_document(doc["text"])):
-                chunks.append(
-                    {
-                        "id": f"{doc['id']}#{i}",
-                        "url": doc["url"],
-                        "title": doc["title"],
-                        "kind": doc.get("kind", ""),
-                        "text": body,
-                        # The title is prepended for embedding/scoring only: a chunk
-                        # from deep in a page otherwise loses all topic context.
-                        "embed_text": f"{doc['title']}\n{body}" if doc["title"] else body,
-                    }
-                )
-    print(f"chrome   : {len(chrome)} repeated lines stripped; {dropped} chrome-only docs dropped")
+
+        lines = body_text.splitlines()
+        cursor = 0
+        for i, body in enumerate(split_document(body_text)):
+            # Which section this chunk fell in, so a chunk from deep inside a
+            # page still carries the heading that says what it is about.
+            first_line = body.splitlines()[0].strip() if body else ""
+            try:
+                cursor = lines.index(first_line, cursor)
+            except ValueError:
+                pass  # overlap text won't match a line exactly; keep the last section
+            section = _section_for(lines, cursor)
+
+            # Title and section are prepended for embedding/scoring only — the
+            # `text` handed to the model stays exactly what the page said.
+            context = "\n".join(p for p in (doc["title"], section) if p)
+            chunks.append(
+                {
+                    "id": f"{doc['id']}#{i}",
+                    "url": doc["url"],
+                    "title": doc["title"],
+                    "section": section,
+                    "kind": doc.get("kind", ""),
+                    "text": body,
+                    "embed_text": f"{context}\n{body}" if context else body,
+                }
+            )
+    print(f"chrome   : {len(chrome)} repeated menu lines stripped; {dropped} chrome-only docs dropped")
     return chunks
 
 
@@ -212,6 +309,10 @@ class BM25:
 
 RRF_K = 60  # standard Reciprocal Rank Fusion constant
 
+# Above this cosine, two chunks are the same content on two pages rather than
+# two views of a topic. See Index._drop_near_duplicates for the measurements.
+NEAR_DUPLICATE_COSINE = float(os.getenv("RETRIEVAL_NEAR_DUPLICATE", "0.98"))
+
 
 @dataclass
 class Hit:
@@ -231,7 +332,9 @@ class Index:
         # "journalism programme" retrieved "Faculty Training Programme". Left
         # out deliberately — don't re-add it without an eval run.
 
-    def search(self, query: str, k: int = 6, pool: int = 30, per_doc: int = 0) -> list[Hit]:
+    def search(
+        self, query: str, k: int = 6, pool: int = 30, per_doc: int = 0, dedupe: bool = True
+    ) -> list[Hit]:
         """Hybrid dense + BM25 search fused with RRF.
 
         Each hit carries both scores because they answer different questions.
@@ -279,7 +382,10 @@ class Index:
         ranked = sorted(fused.items(), key=lambda kv: -kv[1])
         if per_doc > 0:
             ranked = self._diversify(ranked, k, per_doc)
-        top = ranked[:k]
+        # After the per-page cap, before truncating to k: a duplicate that is
+        # dropped here should give its slot to the next distinct chunk, not
+        # leave a hole.
+        top = self._drop_near_duplicates(ranked, k) if dedupe else ranked[:k]
         return [Hit(self.chunks[i], s, float(dense[i])) for i, s in top]
 
     def _diversify(self, ranked: list[tuple[int, float]], k: int, per_doc: int) -> list[tuple[int, float]]:
@@ -299,6 +405,37 @@ class Index:
         # that no other page was able to claim.
         return picked + spill
 
+    def _drop_near_duplicates(self, ranked: list[tuple[int, float]], k: int) -> list[tuple[int, float]]:
+        """Suppress chunks that repeat content already selected.
+
+        ``per_doc`` caps how much of one *page* is used, which does nothing about
+        the same text living on two different pages — and this site is full of
+        that. Every programme runs as "Shift I" and "Shift II" on separate URLs
+        with near-identical prose, so "who can apply for admission" spent two of
+        its eight slots on byte-identical Visual Communication text.
+
+        Measured cosine between chunk vectors separates the cases cleanly:
+
+            0.992  Visual Communication Shift I vs Shift II (identical text)
+            0.915  two different chunks of the same SANKALP page
+            0.808  Contact Us vs Home
+
+        So 0.98 removes the duplicates while leaving genuinely distinct chunks of
+        a shared topic alone. 31 pairs in the corpus are above it; 330 are above
+        0.95, which is why the threshold is not lower.
+        """
+        kept: list[tuple[int, float]] = []
+        for idx, score in ranked:
+            if any(
+                float(self.vectors[idx] @ self.vectors[other]) > NEAR_DUPLICATE_COSINE
+                for other, _ in kept
+            ):
+                continue
+            kept.append((idx, score))
+            if len(kept) >= k:
+                break
+        return kept
+
     def dense_only(self, query: str, k: int = 1) -> list[Hit]:
         sims = self.vectors @ embed_query(query)
         order = np.argsort(-sims)[:k]
@@ -309,8 +446,19 @@ _index: Index | None = None
 _index_lock = threading.Lock()
 
 
+META = DATA_DIR / "index-meta.json"
+
+
 def load() -> Index | None:
-    """Load the persisted index into memory (idempotent, thread-safe)."""
+    """Load the persisted index into memory (idempotent, thread-safe).
+
+    Refuses an index built by a different encoder than the one that will embed
+    queries against it. Dimensions usually differ, so the mismatch would surface
+    as a matmul error — but two encoders of the same width would produce a
+    working matmul over meaningless geometry, ranking chunks by nothing at all.
+    That failure is invisible from the outside: retrieval still returns five
+    confident-looking sources. Better to refuse and serve the curated answers.
+    """
     global _index
     if _index is not None:
         return _index
@@ -319,8 +467,26 @@ def load() -> Index | None:
             return _index
         if not (VECTORS.exists() and CHUNKS.exists()):
             return None
+
+        if META.exists():
+            try:
+                meta = json.loads(META.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                meta = {}
+            built_with = meta.get("embed_model")
+            if built_with and built_with != model_name():
+                raise RuntimeError(
+                    f"index was built with embed model {built_with!r} but this process "
+                    f"queries with {model_name()!r} — rebuild with `python -m kb.index`"
+                )
+
         chunks = [json.loads(ln) for ln in CHUNKS.read_text(encoding="utf-8").splitlines() if ln.strip()]
         vectors = np.load(VECTORS)
+        if vectors.shape[0] != len(chunks):
+            raise RuntimeError(
+                f"index is inconsistent: {vectors.shape[0]} vectors for {len(chunks)} chunks "
+                "— rebuild with `python -m kb.index`"
+            )
         bm25 = BM25.build([tokenize(c["embed_text"]) for c in chunks])
         _index = Index(chunks, vectors, bm25)
         return _index

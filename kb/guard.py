@@ -312,15 +312,58 @@ def _strip_machinery(text: str) -> str:
 
 
 def _is_refusal(text: str) -> bool:
-    """Did the model decline to answer?
+    """Did the model decline *entirely*, or merely add a caveat?
 
-    Exact match on the canonical sentence first — that is what the prompt asks
-    for and it cannot be missed. The phrase list is only a backstop for when the
-    model improvises, which it still sometimes does.
+    This used to be a plain "does any refusal phrase appear anywhere", and that
+    was right while every answer was either an answer or a refusal. It stopped
+    being right once the prompt began asking for **partial** answers — say what
+    the sources support, then admit what is missing — because a good partial
+    answer contains a refusal phrase by construction.
+
+    The cost was severe and silent. Asked "Who can apply for admission?", the
+    model replied:
+
+        "...is a women's college, so only female candidates are admitted. While
+        specific eligibility criteria vary by course, such as the requirement
+        for a class twelve pass for visual communication, I do not have a
+        complete list of requirements for all programs. Please contact our
+        admissions office..."
+
+    — three useful facts and an honest caveat. The clause "I do not have a
+    complete list" matched, so the whole thing was discarded and replaced with
+    the bare canonical refusal. The listener lost every fact the corpus did
+    supply.
+
+    So refusal is now judged per sentence, and only an answer whose sentences
+    are *all* refusals counts as one. A single hedging clause beside real
+    content is a caveat, which is exactly what a partial answer is supposed to
+    look like.
     """
     from .prompts import NO_ANSWER_SENTENCE
 
     low = text.lower().strip()
     if NO_ANSWER_SENTENCE.lower().rstrip(".") in low:
         return True
-    return any(p.search(low) for p in _REFUSAL_PATTERNS)
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", low) if s.strip()]
+    if not sentences:
+        return False
+
+    def refuses(sentence: str) -> bool:
+        return any(p.search(sentence) for p in _REFUSAL_PATTERNS)
+
+    # A sentence that neither refuses nor merely points the visitor elsewhere is
+    # carrying information. "Please contact the college office" is not a refusal
+    # on its own, but it is not content either — an answer made only of refusals
+    # and referrals is still a refusal.
+    return all(refuses(s) or _REFERRAL.search(s) for s in sentences)
+
+
+# Pointing the visitor at a human. Never a refusal by itself — a complete answer
+# may well end this way — but it adds no information, so it cannot be what saves
+# an otherwise-empty reply from counting as a refusal.
+_REFERRAL = re.compile(
+    r"\b(please\s+)?(contact|reach out to|call|visit|check)\b.{0,40}"
+    r"\b(office|website|administration|admissions?|college|department|portal)\b",
+    re.I,
+)

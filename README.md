@@ -1,36 +1,143 @@
-# SIA Voice Service (TTS + STT)
+# SIA Voice Service
 
-A small, self-contained FastAPI service that gives SIA **one consistent
-Indian-female voice on every browser/device** and cross-browser speech input —
-all open source, no paid APIs.
+A small FastAPI service that answers questions about Shasun Jain College,
+grounded in the scraped college website, and speaks the answer in **one
+consistent Indian-female voice on every browser/device**.
 
 | Endpoint | Method | In | Out |
 |----------|--------|----|-----|
 | `/tts`   | POST   | `{ "text": "..." }` (JSON) | `audio/wav` |
 | `/tts/stream` | POST | `{ "text": "..." }` (JSON) | length-prefixed WAV clips, one per sentence |
-| `/stt`   | POST   | `audio` file (multipart)   | `{ "text": "..." }` |
+| `/stt`   | POST   | `audio` file (multipart)   | `{ "text": "...", "engine": "gemini", "duration_s": 2.4 }` |
 | `/ask`   | POST   | `{ "question": "..." }` (JSON) | `{ "answer": "...", "grounded": true, "sources": [...] }` |
 | `/content`| GET   | –  | `{ "greeting": "...", "suggestions": [...] }` |
 | `/health`| GET    | –  | status JSON |
 | `/voices`| GET    | –  | list of Kokoro voice ids (confirm `hf_alpha`) |
 
-`/ask` answers open-ended questions from the **scraped college website**, grounded
-in retrieved sources and defended against prompt injection — see
-[`kb/README.md`](./kb/README.md) for the retrieval design and the security model.
-Without an `ANTHROPIC_API_KEY` (or with `KB_ENABLED=0`) it falls back to the
+## What runs where, and why
+
+Remote and local is a deliberate split, not a default.
+
+| | runs on | why |
+|---|---|---|
+| **Answering** | Gemini `gemini-3.1-flash-lite` | Quality dominates, and the job that matters most — declining a question the corpus cannot answer — is where the old local 1.5B model was weakest. ~$0.0005/answer, and most questions never reach it. |
+| **Embeddings** | Gemini `gemini-embedding-001` (768-d) | Trained for question-to-passage search with an explicit `task_type`. This is what made the off-topic gate work at all (see below). |
+| **Speech to text** | Gemini audio, → faster-whisper | The vocabulary is the hard part, not the language. The prompt carries a college glossary so "Shasun" and "B.Com Corporate Secretaryship" survive. Whisper takes over automatically when the API is unreachable. |
+| **Speech synthesis** | Kokoro-82M, local | Free per request, CPU-only, disk-cached — and a voice that is identical on every browser is the product. Remote TTS would be strictly worse on all four counts. |
+
+`/ask` is grounded in retrieved sources and defended against prompt injection —
+see [`kb/README.md`](./kb/README.md) for the retrieval design and the security
+model. Without a `GEMINI_API_KEY` (or with `KB_ENABLED=0`) it falls back to the
 curated answers in [`knowledge.py`](./knowledge.py), whose clips are prewarmed.
+
+## How a question is answered
+
+Retrieve-then-generate is not enough, and one example shows why. Asked to
+**"write a python program"**, the assistant used to reply with the college's
+academic programmes — because the word "program" matched pages like "Digital
+Marketing Proficiency Program" at 0.597 similarity, and nothing downstream ever
+asked whether *writing software* is something it does.
+
+No threshold can fix that. Similarity measures topical overlap, and the overlap
+is real. So the pipeline asks two questions a person would ask — *is this
+something I do?* and *does what I found actually answer it?* — in four stages:
+
+```
+question
+  │
+  ├─ 1. TRIAGE     kb/triage.py — pattern check for obviously out-of-scope
+  │                requests. Free, no API call. Zero false positives on 32 real
+  │                college questions; catches 15 of 15 out-of-scope ones.
+  │                        └─▶ out of scope: refuse, stop here
+  │
+  ├─ 2. RETRIEVE   hybrid dense + BM25 + RRF, then
+  │                  · per-page cap (one page may take 2 of k slots)
+  │                  · near-duplicate suppression (cosine > 0.98)
+  │                  · relative margin — drop chunks far below the best hit
+  │                one adaptive rewrite if the question is too thin to match on
+  │                        └─▶ nothing above the floor: refuse, stop here
+  │
+  ├─ 3. VERIFY     one schema-constrained call returns scope + sufficiency +
+  │                answer. The model judges the question against the sources it
+  │                was given, and must commit to a verdict as a field.
+  │
+  └─ 4. ROUTE      scope=out_of_scope  → "that's outside what I can help with"
+                   sufficiency=full    → answer from the sources
+                   sufficiency=partial → the facts, then what's missing
+                   sufficiency=none    → "I don't have that detail" + the office
+```
+
+Verification is free: it is the same call that writes the answer, constrained to
+a schema, measured at the same ~870 ms as free text. What it buys is that the
+judgement is an explicit field rather than something the caller has to infer
+from the tone of a sentence.
+
+**The two refusals are different sentences on purpose.** Telling someone who
+asked for a Python program to "contact the college office" is nonsense; telling
+someone who asked about fees that their question is "outside what I can help
+with" turns a gap in the corpus into an apparent brush-off. Only questions that
+were about the college get pointed at the college.
+
+| you ask | scope | sufficiency | you get |
+|---|---|---|---|
+| "write a python program" | out_of_scope | – | outside what I can help with |
+| "is there a certificate program in Python?" | college | full | *answers* — there is an add-on Python course |
+| "what programs do you offer" | college | full | the actual programme list |
+| "what is the fee for B.Com" | college | none | I don't have that detail → college office |
+| "who can apply for admission?" | college | partial | women-only, plus what the sources do say |
 
 `/tts/stream` exists because whole-answer synthesis is the wrong shape for a
 voice UI: Kokoro runs below real time, so a long answer means several seconds of
 silence first. Streaming per sentence measured **2x faster to first audio** and
 stays gapless. The frontend prefers it and falls back to `/tts`.
 
-- **TTS** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) via
-  [`kokoro-onnx`](https://github.com/thewh1teagle/kokoro-onnx) (ONNX Runtime, no
-  PyTorch). Voice `hf_alpha` (Hindi female) + `lang=en-us` → warm Indian-accented
-  English. Clips are disk-cached, so the fixed set of answers is synthesized once.
-- **STT** — [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
-  (CTranslate2). Great on Indian-accented English.
+## Measured behaviour
+
+Scored by `python -m tests.eval_accuracy --answers` on 15 questions verified
+against the live site, plus 5 questions the corpus cannot answer.
+
+| | before | after |
+|---|---|---|
+| retrieval recall | 12/15 (80%) | **14/15 (93%)** |
+| answer accuracy | — | **15/15 (100%)** |
+| off-topic past the gate | 5/5 leaked | **0/5** |
+| off-topic declined by the model | inconsistent | **5/5** |
+| corpus actually indexed | 19% | **~100%** |
+| answer latency (median) | 6–12 s | **1.1 s** |
+| retrieval latency (median) | 6 ms | 420 ms |
+| resident memory | ~1.5 GB | ~350 MB |
+
+Two of those deserve a note.
+
+**Retrieval got slower.** Query embedding is now a network round-trip, so
+retrieval went from 6 ms to ~420 ms. That is a real regression, paid for
+deliberately: it buys the recall and gate numbers above, and it is invisible next
+to the 1.1 s answer it precedes. Repeat questions skip it via an in-process LRU,
+and the semantic answer cache skips the whole pipeline.
+
+**The off-topic gate became possible.** It used to be a pure cost filter,
+because retrieval scores could not separate on- from off-topic on this corpus —
+the site really does contain cricket results, so "who won the cricket world cup"
+really does match a tournament page. Under the new encoder the bands separate
+cleanly, so the gate now rejects most off-topic questions before they cost a
+generation, with the model still the backstop:
+
+| encoder | on-topic | off-topic | overlap |
+|---|---|---|---|
+| BGE (before) | 0.569–0.699 | 0.422–0.583 | yes |
+| gemini-embedding-001 | 0.638–0.741 | 0.499–0.567 | **no** |
+
+## Layout
+
+```
+app.py          # assembly only: middleware, CORS, router mounting
+config.py       # every environment-driven setting in one place
+routers/        # HTTP surface — chat.py, voice.py, health.py
+services/       # tts.py (Kokoro), stt.py (Gemini + Whisper), prewarm.py, runtime.py
+kb/             # corpus, retrieval, answering, guards — see kb/README.md
+knowledge.py    # curated fallback answers
+speech.py       # sentence segmentation for streaming synthesis
+```
 
 ### Why answers play instantly
 
@@ -98,19 +205,45 @@ re-download them. Render binds `$PORT` automatically.
 
 ## Configuration (env vars)
 
+Full list with commentary in [`.env.example`](./.env.example).
+
 | Var | Default | Notes |
 |-----|---------|-------|
+| `GEMINI_API_KEY` | – | **Required.** Covers answering, embeddings and STT. `GOOGLE_API_KEY` also accepted. |
+| `GEMINI_TEXT_MODEL` | `gemini-3.1-flash-lite` | Cheapest model that answered correctly and declined off-topic. Don't use a `-latest` alias — answer text is the TTS cache key. |
+| `GEMINI_AUDIO_MODEL` | `gemini-3.5-flash-lite` | Cheapest audio-input rate. |
+| `GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Changing this invalidates the index *and* the similarity gate. |
+| `GEMINI_EMBED_DIM` | `768` | Matryoshka truncation. Vectors arrive unnormalized at <3072 and are renormalized in `kb/embed.py`. |
+| `GEMINI_EMBED_RPM` | `90` | Paces an index rebuild under the free tier's 100 texts/min. Raise on a paid key. |
+| `RETRIEVAL_MIN_SIMILARITY` | `0.60` | Calibrated to the encoder above; see the table earlier. |
+| `RETRIEVAL_TOP_K` | `8` | Was 5 when prefill cost 7 ms/token locally. No longer a constraint. |
+| `EMBED_BACKEND` | `gemini` | `local` runs the bundled BGE ONNX encoder instead (no key, lower quality). Requires a rebuild. |
+| `STT_BACKEND` | `gemini` | `whisper` skips the API entirely. |
 | `TTS_VOICE` | `hf_alpha` | Any Kokoro voice id (see `/voices`). |
 | `TTS_LANG` | `en-us` | `en-us` = correct English + Indian timbre; `hi` = stronger Hindi phonology. |
 | `TTS_SPEED` | `0.9` | <1 slower/calmer. |
 | `KOKORO_MODEL` | `auto` | `auto` = fastest weights present (fp32 → fp16 → int8). Pin to `kokoro-v1.0.int8.onnx` for low RAM. |
 | `ONNX_THREADS` | `min(4, cores)` | Kokoro peaks near 4 threads and *regresses* past it. |
 | `PREWARM` | `1` | Pre-synthesize the knowledge base at boot. `0` on a tiny instance. |
-| `PREWARM_STT` | `1` | Load Whisper at boot (~200 MB). `0` on a tiny instance. |
+| `PREWARM_STT` | `0` | Load the Whisper *fallback* at boot (~200 MB). Now off by default — it only serves a path that runs when Gemini is unreachable. |
 | `TTS_CACHE_DIR` | `./tts-cache` | Where synthesized clips are kept. |
-| `WHISPER_MODEL` | `base` | `tiny` (lighter) → `small` (more accurate). |
+| `WHISPER_MODEL` | `base` | Fallback engine. `tiny` (lighter) → `small` (more accurate). |
 | `WHISPER_COMPUTE` | `int8` | `int8` is smallest/fastest on CPU. |
 | `ALLOW_ORIGINS` | `*` | Comma-separated allowed origins. |
+
+### Rebuilding the knowledge base
+
+The index is **committed**, not built during the Docker build — embeddings are a
+metered API call now, so building in the image would need a live key and could
+fail on a 429. Re-run these locally whenever the site is re-scraped:
+
+```bash
+python -m kb.ingest     # crawl -> kb-data/corpus.jsonl  (~40 min; HTML is cached)
+python -m kb.index      # embed -> vectors.npy + chunks.jsonl  (~8 min, quota-paced)
+```
+
+`kb-data/embed-cache.jsonl` keys every vector by content, so a rebuild after a
+chunker tweak only re-embeds what actually changed.
 
 **On model choice:** counter-intuitively the **fp32** Kokoro weights are ~2×
 *faster* than the int8 ones on CPU (measured RTF 0.42 vs 0.86) — ONNX Runtime's
@@ -140,21 +273,52 @@ and `curl -i -X POST https://<service>/tts -H "Content-Type: application/json" -
 
 ## RAM / cost notes
 
-No GPU needed — both models run on CPU. Real-world behaviour observed:
+No GPU needed. **Not everything is remote** — two models are deliberately local,
+and they are what the memory budget is made of:
 
-- **Render Free (512 MB)** — **not recommended.** The shared CPU takes ~60 s to
-  cold-load a model (→ 502s past the proxy timeout), the instance spins down when
-  idle, and Kokoro + Whisper together **OOM-kill the worker** (502 with an empty
-  body, which the browser reports as a CORS error). Fine for a quick demo, not
-  for real use.
-- **Render Standard (2 GB, always-on)** — **recommended.** Holds both models
-  comfortably; with `WARMUP=1` the first request is fast. Use `WHISPER_MODEL=base`
-  here for better accuracy.
-- **Render Starter ($7, 512 MB, always-on)** — tight but possible: keep
-  `WHISPER_MODEL=tiny`, `KOKORO_MODEL=kokoro-v1.0.int8.onnx`, `CPU_THREADS=1`.
-  Always-on avoids the cold-start, but RAM is still near the edge if both models
-  load at once.
+| | where | why |
+|---|---|---|
+| answering, embeddings, STT | Gemini | quality dominates; see the table at the top |
+| **TTS (Kokoro-82M)** | **local** | free per request, CPU-only, disk-cached, and one identical voice everywhere |
+| **answer-cache encoder (MiniLM)** | **local** | its 0.65/0.93 thresholds are calibrated to this model; keeps a cache hit free and offline |
+| STT fallback (faster-whisper) | local, optional | only runs when Gemini is unreachable |
 
-`WARMUP=1` loads both models at boot (only helps on always-on plans). The frontend
-also retries through transient 502s and shows a "Preparing voice…" state, and each
-`/tts` clip is disk-cached so repeat answers are instant.
+Measured resident memory (psutil RSS, int8 Kokoro, `ONNX_THREADS=1`):
+
+| stage | RSS |
+|---|---|
+| python + fastapi + google-genai SDK | 106 MB |
+| + retrieval index (704 chunks × 768d) | 124 MB |
+| + MiniLM answer-cache encoder | 185 MB |
+| + Kokoro TTS int8 | **323 MB** ← steady state |
+| + PyAV (decodes browser audio, primary path) | 336 MB |
+| + faster-whisper `tiny` fallback | 447 MB |
+| + faster-whisper `base` fallback | 478 MB ← worst case |
+
+For comparison, the old stack was ~1.5 GB, dominated by the 986 MB Qwen GGUF.
+
+### Does it fit Render's free tier (512 MB)?
+
+**Yes, at 323 MB — but only with `STT_FALLBACK=0`.** Loading the local Whisper
+fallback leaves 34 MB of headroom, which will not survive a traffic spike; an
+OOM-kill shows up as a 502 with no body, which the browser then reports as a CORS
+error. With the fallback dropped, Gemini still transcribes, and if it is
+unreachable the mic degrades to the browser's own recognition.
+
+Three free-tier caveats that are not about memory:
+
+- **It spins down when idle.** The first request after a sleep takes ~60 s to
+  wake and can 502 past the proxy timeout. The frontend retries and recovers.
+- **The disk is ephemeral.** The TTS cache is lost on every restart, so `PREWARM`
+  re-synthesizes the fixed answers each cold start — free, but slow on a shared CPU.
+- **Gemini's free tier caps embeddings at 1000/day**, and every *unique* question
+  costs one. That is the real ceiling, not RAM. Repeats are free (in-process LRU
+  plus the semantic answer cache), and a paid key removes the limit.
+
+`starter` ($7, always-on, 512 MB) avoids the first two and is what `render.yaml`
+sets.
+
+Per-request cost is roughly **$0.0005** for a generated answer (~2500 prompt
+tokens in, ~30 out) and a fraction of that for a transcription. Most traffic
+costs nothing: the suggestion chips are answered at boot, and the semantic answer
+cache serves paraphrases verbatim — so the TTS clips are already on disk too.

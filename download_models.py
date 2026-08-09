@@ -47,7 +47,10 @@ def main() -> None:
         print(f"[warn] falling back to {FALLBACK_MODEL}")
         _download(FALLBACK_MODEL)
 
-    # Pre-download the Whisper weights into the image's HF cache.
+    # Pre-download the Whisper weights into the image's HF cache. Whisper is the
+    # STT *fallback* now, but baking it in is still right: the moment it is
+    # needed is the moment the network to Google is already failing, which is
+    # the worst possible time to discover the weights were never fetched.
     model = os.getenv("WHISPER_MODEL", "base")
     compute = os.getenv("WHISPER_COMPUTE", "int8")
     print(f"[get ] faster-whisper '{model}' ({compute})")
@@ -59,17 +62,21 @@ def main() -> None:
     print("[done] all models cached")
 
 
-# Knowledge-base models. Both are small and CPU-only: embeddings run on the same
-# ONNX Runtime as Kokoro, and generation runs on llama.cpp. Skipped when
-# KB_ENABLED=0 so a TTS/STT-only deployment stays lean.
+# Knowledge-base models.
+#
+# Only MiniLM is still fetched. It is the *symmetric* encoder behind the answer
+# cache — comparing two questions to each other — which is pinned local on
+# purpose: its 0.65/0.93 thresholds were calibrated against this model's score
+# distribution, and it keeps a cache lookup free and offline. See kb/embed.py.
+#
+# Two downloads that used to live here are gone: the 986 MB Qwen2.5-1.5B GGUF
+# (generation moved to Gemini) and the BGE retrieval encoder (retrieval
+# embeddings are a Gemini call now). BGE is still supported via
+# EMBED_BACKEND=local, but it is no longer baked into every image for a path
+# most deployments never take.
 _HF_FILES = [
     ("Xenova/all-MiniLM-L6-v2", "onnx/model_quantized.onnx", "models/minilm/model.onnx"),
     ("Xenova/all-MiniLM-L6-v2", "tokenizer.json", "models/minilm/tokenizer.json"),
-    (
-        os.getenv("LLM_REPO", "bartowski/Qwen2.5-1.5B-Instruct-GGUF"),
-        os.getenv("LLM_FILE", "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"),
-        "models/llm/qwen2.5-1.5b.gguf",
-    ),
 ]
 
 

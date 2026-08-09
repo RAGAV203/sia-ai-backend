@@ -111,8 +111,28 @@ _CHROME_SELECTORS = (
     "[class*=nav-menu]",
     "[class*=sidebar]", "[class*=widget-area]",
     "[class*=cookie]", "[class*=popup]", "[class*=modal]",
+    # Popup Maker renders the *entire* 226-entry faculty directory into the
+    # markup of every page as hidden popups — 535 KB of identical text per page,
+    # on 145 pages. `[class*=popup]` does not catch it, because the plugin's
+    # classes are `pum-*` and `popmake-*`; that near-miss is what let it through.
+    #
+    # The cost was not merely wasted bytes. The chunker subtracts lines that
+    # repeat across documents, so this bundle looked exactly like site chrome and
+    # took **82% of the corpus with it** (3.35M chars in, 642K indexed) —
+    # deleting genuine faculty specializations and syllabus lines corpus-wide
+    # because they happened to appear inside it. Removing it here is what makes
+    # the frequency filter in `index.py` safe to keep.
+    #
+    # The directory is not discarded: `extract_directory()` below emits it once
+    # as its own document, so "who teaches psychology" still has something to
+    # retrieve. Deduplicated, not deleted.
+    "[class*=pum-]", "[class*=popmake]", "[id*=popmake]", "[id*=pum-]", "[class*=pum_]",
     ".screen-reader-text", ".skip-link",
 )
+
+# The Popup Maker container that holds one directory entry: name, designation,
+# qualifications, experience, email.
+_DIRECTORY_ENTRY_SELECTOR = "[class*=pum-container]"
 
 # Containers that are *sometimes* navigation and sometimes content, so they are
 # judged by link density rather than by class name. Elementor renders both its
@@ -227,6 +247,52 @@ def page_html_to_text(html: str) -> str:
         lines.append(stripped)
 
     return "\n".join(lines)[:MAX_DOC_CHARS]
+
+
+# Widget furniture that sits inside a directory entry but says nothing about the
+# person, plus the mojibake left by the site's broken icon-font characters.
+_DIRECTORY_NOISE = re.compile(r"^(close|read more|view profile|x|\W*)$", re.I)
+
+
+def extract_directory(html: str) -> list[str]:
+    """Pull the faculty directory out of a page's hidden Popup Maker markup.
+
+    The plugin stamps the same 226-entry staff list into every page. It is real,
+    answerable content — "who teaches psychology", "what are the lecturer's
+    qualifications" — but repeated 145 times it is indistinguishable from site
+    chrome, and the frequency filter downstream treats it as such.
+
+    So it is lifted out exactly once, here, and indexed as a single document.
+    Each entry becomes one line pairing the name with the credentials that
+    follow it, because the two live in different elements and split apart they
+    are both useless: a bare name retrieves nothing, and "Assistant Professor,
+    M.Com, 1.4 years" belongs to nobody.
+
+    Returns one string per person, or an empty list on a page with no directory.
+    """
+    if not html:
+        return []
+
+    tree = HTMLParser(html)
+    entries: list[str] = []
+    seen: set[str] = set()
+
+    for node in tree.css(_DIRECTORY_ENTRY_SELECTOR):
+        parts = [
+            line.strip()
+            for line in clean_text(node.text(separator="\n")).splitlines()
+            if line.strip() and not _DIRECTORY_NOISE.match(line.strip())
+        ]
+        if len(parts) < 2:
+            continue  # a popup with no person in it (a promo banner, say)
+        entry = f"{parts[0]} — {', '.join(parts[1:])}"
+        key = entry.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+
+    return entries
 
 
 # Phrases whose only purpose in *reference content* is to redirect a model.

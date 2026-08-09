@@ -55,9 +55,46 @@ NEGATIVES = [
 ]
 
 
+# SIA is instructed to write what she says out loud — "10 plus 2" rather than
+# "10+2" — because the text goes straight to a speech synthesizer that would
+# otherwise read punctuation as punctuation.
+#
+# That collided with this eval, which scored answers by substring. Two correct
+# answers were counted wrong for obeying the prompt:
+#
+#   "A plus plus grade from the National Assessment..."   vs expected "a++"
+#   "info at shasuncollege dot edu dot in"                vs expected "shasuncollege.edu.in"
+#
+# Rather than weaken the expectations to spoken spellings — which would stop
+# catching a genuinely missing grade — both sides are folded back to the written
+# form before comparing. The check then tests the fact, not the transcription.
+_SPOKEN = (
+    (" plus plus", "++"),
+    (" plus ", "+"),
+    (" dot ", "."),
+    (" at ", "@"),
+    (" underscore ", "_"),
+    (" dash ", "-"),
+    # Numbers are spoken as words for the same reason, so "class twelve" has to
+    # satisfy an expectation written as "12".
+    (" twelve", " 12"),
+    (" ten", " 10"),
+    (" eleven", " 11"),
+    (" two point one", " 2.1"),
+)
+
+
+def _fold_spoken(text: str) -> str:
+    low = f" {text.lower()} "
+    for spoken, written in _SPOKEN:
+        low = low.replace(spoken, written)
+    return low
+
+
 def matches(text: str, needles: list[str]) -> bool:
     low = text.lower()
-    return any(n.lower() in low for n in needles)
+    folded = _fold_spoken(text)
+    return any(n.lower() in low or n.lower() in folded for n in needles)
 
 
 def corpus_ceiling() -> tuple[int, list[str]]:

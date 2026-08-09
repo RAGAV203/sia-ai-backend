@@ -22,12 +22,31 @@ tts-cache/
 .DS_Store
 Thumbs.db
 
-# Knowledge base artifacts. The derived index and caches are rebuilt with
-# `python -m kb.index`, but corpus.jsonl is the scrape output and IS committed:
-# it takes ~40 minutes to regenerate against the live site, and the Docker build
-# bakes the index from it rather than crawling during a build.
-kb-data/
+# Knowledge base artifacts.
+#
+# The corpus is the scrape output and IS committed: it takes ~40 minutes to
+# regenerate against the live site.
+#
+# The *index* is now committed too, which it did not used to be. Embeddings were
+# a local ONNX model, so the Docker build could rebuild the index for free; they
+# are a metered Gemini call now, so rebuilding at image-build time would need a
+# live key, spend quota, and could fail on a 429 — for an artifact that only
+# changes when the corpus does. Build it locally with `python -m kb.index` and
+# commit the result; the image just uses it.
+kb-data/*
 !kb-data/corpus.jsonl
+!kb-data/chunks.jsonl
+!kb-data/vectors.npy
+!kb-data/index-meta.json
+
+# Derived caches: rebuilt on demand, machine-specific, and large.
+# embed-cache.jsonl makes a re-index incremental (only changed chunks are sent
+# to the API) but it is reproducible, so it stays out of the repo.
+kb-data/embed-cache.jsonl
+kb-data/answer-cache*.jsonl
+kb-data/html-cache/
+kb-data/quarantine.jsonl
+kb-data/corpus.before.jsonl
 models/
 
 debug.log

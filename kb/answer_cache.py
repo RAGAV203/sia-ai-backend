@@ -86,16 +86,25 @@ class AnswerCache:
         self._vectors = np.array([r["vector"] for r in rows], dtype=np.float32)
         print(f"[cache] {len(rows)} cached answers loaded")
 
-    def get(self, question: str, top_chunk_id: str | None = None) -> dict | None:
+    def get(self, question: str, top_chunk_id=None) -> dict | None:
         """Return a cached answer for an equivalent question, or None.
 
-        `top_chunk_id` is the id of the best chunk this question retrieves. When
-        supplied it corroborates a merely-similar question, letting the cache
-        serve paraphrases without loosening the similarity bar itself.
+        ``top_chunk_id`` is the id of the best chunk this question retrieves.
+        When supplied it corroborates a merely-similar question, letting the
+        cache serve paraphrases without loosening the similarity bar itself.
+
+        **Pass a callable, not a value.** Computing it costs a query embedding —
+        a metered API call, capped at 1000/day on the free tier — and it is only
+        consulted for scores in the corroboration band. Passing it eagerly meant
+        every request paid for it, including the verbatim cache hits whose whole
+        purpose is to cost nothing. A callable is invoked only if it is actually
+        needed. A plain value still works, for callers that already have one.
         """
         with self._lock:
             if not len(self._vectors):
                 return None
+            # embed_symmetric is the pinned *local* encoder — free and offline,
+            # which is what lets a cache lookup happen before any API call.
             sims = self._vectors @ embed_symmetric(question)
             best = int(np.argmax(sims))
             score = float(sims[best])
@@ -104,11 +113,10 @@ class AnswerCache:
 
         if score >= self.threshold:
             match_kind = "verbatim"
-        elif (
-            score >= CORROBORATED_THRESHOLD
-            and top_chunk_id
-            and payload.get("top_chunk_id") == top_chunk_id
-        ):
+        elif score >= CORROBORATED_THRESHOLD:
+            resolved = top_chunk_id() if callable(top_chunk_id) else top_chunk_id
+            if not resolved or payload.get("top_chunk_id") != resolved:
+                return None
             match_kind = "corroborated"
         else:
             return None
