@@ -9,6 +9,7 @@ splitting on "." shatters a programme name into three unspeakable fragments.
 
 from __future__ import annotations
 
+import os
 import re
 
 # Abbreviations whose trailing period never ends a sentence. Matched
@@ -28,10 +29,18 @@ MIN_SENTENCE_CHARS = 25   # below this, merge forward — a 3-word clip isn't wo
 MAX_SENTENCE_CHARS = 320  # above this, synthesis latency defeats the point of streaming
 
 # The opening clip is the only one the listener actually waits on, so it is
-# sized for latency while the rest are sized for throughput. It still has to
-# cover synthesis of the clip behind it: at RTF ~0.75 a 100-char opener buys
-# ~4s of playback against ~2.5s of work, which holds comfortably.
-FIRST_SENTENCE_MAX_CHARS = 110
+# sized for latency while the rest are sized for throughput.
+#
+# It used to be 110, because synthesis was serial and playback of clip N had to
+# cover synthesis of clip N+1 — a short opener bought a fast start and then ran
+# dry. Sentences are now synthesized several at a time (config.SYNTH_WORKERS),
+# so clip 2 is already being rendered while clip 1 plays and the opener no
+# longer has to fund it.
+#
+# Removing that constraint is worth roughly two seconds of silence at the start
+# of every answer: a 69-char opener measured 4.2s of audio and 4.8s to
+# first sound, where a ~60-char one starts speaking in about half that.
+FIRST_SENTENCE_MAX_CHARS = int(os.getenv("TTS_FIRST_SENTENCE_CHARS", "60"))
 
 
 def _ends_with_abbreviation(text: str) -> bool:

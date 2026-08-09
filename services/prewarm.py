@@ -18,7 +18,7 @@ import time
 
 from config import CACHE_DIR, PREWARM, PREWARM_STT, TTS_LANG, TTS_SPEED, TTS_VOICE
 from knowledge import public_suggestions, spoken_texts
-from services.tts import cached_wav
+from services.tts import cached_wav, warm_sessions
 from speech import split_sentences
 
 # Exposed on /health so "still warming" is distinguishable from "broken".
@@ -59,6 +59,11 @@ def _worker(answer_cache) -> None:
     status["total"] = len(texts)
     started = time.perf_counter()
     try:
+        # Build and prime every synthesis session first. Otherwise the first
+        # streamed answer pays ONNX arena allocation on each session, which
+        # measured as roughly double the steady-state synthesis time — and it
+        # lands on the one clip the listener is actually waiting for.
+        warm_sessions()
         for text in texts:
             cached_wav(text, TTS_VOICE, TTS_LANG, TTS_SPEED)
             status["done"] += 1

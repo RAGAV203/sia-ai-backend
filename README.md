@@ -88,8 +88,66 @@ were about the college get pointed at the college.
 
 `/tts/stream` exists because whole-answer synthesis is the wrong shape for a
 voice UI: Kokoro runs below real time, so a long answer means several seconds of
-silence first. Streaming per sentence measured **2x faster to first audio** and
-stays gapless. The frontend prefers it and falls back to `/tts`.
+silence first. Streaming per sentence gets to first audio far sooner. The
+frontend prefers it and falls back to `/tts`.
+
+### Keeping streamed speech continuous
+
+Sentence streaming only works while synthesis outruns playback. It did not, and
+the symptom was speech arriving in audible chunks. Three causes, all measured on
+one ~19-second answer, three runs per configuration on a busy machine:
+
+| `TTS_WORKERS` | time to first audio | RTF | gaps | worst gap |
+|---|---|---|---|---|
+| 1 (the old behaviour) | 5.3 s | 1.6 | 2–3 | **4.9–7.2 s** |
+| **2** (default) | 5.7 s | 0.90 | 1 | 1.5 s |
+| 3 | 7.2 s | 0.83 | **0** | 0 |
+| any, warm cache | 0.02 s | – | 0 | 0 |
+
+How many workers it takes to reach zero depends on how loaded the host is — on
+an idle machine 2 was already gapless. 2 is the default because it removes the
+multi-second stalls that made speech unlistenable and halves worst-case latency,
+without a third copy of the weights. Raise it to 3 if RAM allows and cold-cache
+answers still sound chunky.
+
+The warm-cache row is the one most users experience: fixed answers are
+prewarmed and the semantic cache serves repeats verbatim, so only a genuinely
+novel question synthesizes live.
+
+Other measured improvements, independent of worker count:
+
+| | before | after |
+|---|---|---|
+| silence at each seam | ~135 ms, uneven | 72 ms, uniform |
+| repeat answer (cached) | – | 34 ms for the whole stream |
+
+1. **One session could not keep up.** int8 Kokoro runs at RTF 0.95 — no margin,
+   so the prewarm thread or a second listener pushed it past 1.0 and playback
+   drained faster than clips arrived. Sentences are now synthesized on a pool of
+   sessions (`TTS_WORKERS`, default 2). Kokoro is small and cannot use many
+   cores in one session, so the thread budget is *split* across sessions rather
+   than widening one: 2 workers × 2 threads (RTF 0.55) beat 1 × 4 (0.95) and
+   2 × 4 (0.63).
+
+2. **Every clip carried the vocoder's own padding** — ~25 ms before and ~110 ms
+   after — which butt-joining turned into dead air at every seam. It is now
+   trimmed and replaced by one deliberate, uniform 60 ms pause. A short gap
+   between sentences is wanted; an arbitrary one is not.
+
+3. **espeak is not thread-safe.** Parallel synthesis initially produced mangled
+   output ("number of lines in input and output must be equal") because Kokoro's
+   phonemizer calls into a C library with process-global state — intermittently,
+   and returning a *wrong* clip rather than an error. Phonemization is now
+   serialized under a lock while the vocoder pass, which is the slow part, still
+   runs concurrently.
+
+Two things measured worse and were rejected: rendering the opening clip
+exclusively before submitting the rest (first audio 3.4 s instead of 4.7 s, but
+**1.3 s of silence** at the first seam), and 3 workers (no gap, but first audio
+4.9 s as the thread budget spread too thin).
+
+On a warm cache — the normal case, since the fixed answers are prewarmed and the
+semantic cache serves paraphrases verbatim — the whole stream returns in 34 ms.
 
 ## Measured behaviour
 
@@ -299,11 +357,33 @@ For comparison, the old stack was ~1.5 GB, dominated by the 986 MB Qwen GGUF.
 
 ### Does it fit Render's free tier (512 MB)?
 
-**Yes, at 323 MB — but only with `STT_FALLBACK=0`.** Loading the local Whisper
-fallback leaves 34 MB of headroom, which will not survive a traffic spike; an
-OOM-kill shows up as a 502 with no body, which the browser then reports as a CORS
-error. With the fallback dropped, Gemini still transcribes, and if it is
-unreachable the mic degrades to the browser's own recognition.
+**It fits, but not with gapless speech. Those are two different questions.**
+
+Everything except synthesis is cheap: the app, the retrieval index and the
+answer-cache encoder together are ~185 MB. Synthesis is what costs, and
+*continuous* synthesis costs more than one session:
+
+| TTS config | RSS (TTS only) | RTF | gaps |
+|---|---|---|---|
+| 1 session, arena on | 378 MB | 1.40 | **3** |
+| 2 sessions, arena on | 598 MB | 0.96 | 0 |
+| 2 sessions, arena off | 336 MB | 1.21 | 2 |
+| 3 sessions, arena off | 455 MB | 0.95 | 0 |
+
+A single session cannot keep ahead of playback, and every configuration that can
+needs ~450 MB or more for TTS alone. So on a 512 MB instance you must pick:
+
+- **`TTS_WORKERS=1`** — fits, and *most* answers still sound perfect, because
+  the fixed answers are prewarmed and the semantic cache serves repeats verbatim
+  (34 ms for a whole stream). Only a genuinely novel question synthesizes live,
+  and only that one sounds chunky.
+- **`TTS_WORKERS=2` + `TTS_MEM_ARENA=0`** — 336 MB, mostly smooth, occasional
+  short gap. The middle option.
+- **Standard (2 GB)** — `TTS_WORKERS=2`, arena on, always gapless.
+
+Also set **`STT_FALLBACK=0`** on 512 MB: the local Whisper fallback costs
+111–155 MB, and an OOM-kill shows up as a 502 with no body, which the browser
+then reports as a CORS error. Gemini still transcribes without it.
 
 Three free-tier caveats that are not about memory:
 

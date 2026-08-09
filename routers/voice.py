@@ -68,6 +68,12 @@ def tts_stream(req: TtsRequest):
     Each sentence is cached individually, so stock phrasings ("Is there anything
     else I can help with?") are already on disk across different answers — a
     finer-grained hit than the whole-answer cache can give.
+
+    Clips are synthesized **several at a time** and delivered in order. The
+    serial version of this loop only advanced as fast as one Kokoro session,
+    which measured slower than real time on int8 (RTF 0.95) — so the client ran
+    out of audio mid-answer and a gap opened at every sentence boundary. See
+    ``config.SYNTH_WORKERS``.
     """
     text = (req.text or "").strip()
     if not text:
@@ -79,12 +85,9 @@ def tts_stream(req: TtsRequest):
     sentences = split_sentences(text)
 
     def frames():
-        for sentence in sentences:
-            try:
-                wav = tts_service.cached_wav(sentence, voice, lang, speed)
-            except Exception as exc:  # noqa: BLE001 - one bad clip must not kill the stream
-                print(f"[tts/stream] sentence failed ({exc}); skipping")
-                continue
+        for wav in tts_service.synthesize_ordered(sentences, voice, lang, speed):
+            if wav is None:
+                continue  # one bad clip must not kill the stream
             yield struct.pack(">I", len(wav)) + wav
 
     return StreamingResponse(

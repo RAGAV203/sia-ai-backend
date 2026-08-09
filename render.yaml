@@ -44,6 +44,13 @@ services:
         value: en-us
       - key: TTS_SPEED
         value: "0.9"
+      # Sentences synthesized concurrently. One session runs at RTF 0.95 on
+      # int8 — slower than playback — so streamed speech arrived in audible
+      # chunks. Two sessions reach RTF 0.62 and stream gaplessly, at the cost of
+      # a second copy of the weights (~92 MB int8). Drop to 1 only if memory
+      # forces it, and expect choppy audio if you do.
+      - key: TTS_WORKERS
+        value: "2"
 
       # --- models -----------------------------------------------------------
       # Chosen by measurement, not by tier — see kb/gemini.py for the table.
