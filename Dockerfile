@@ -3,7 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/models/hf \
-    TTS_CACHE_DIR=/tmp/tts-cache
+    TTS_CACHE_DIR=/tmp/tts-cache \
+    TRANSLATION_CACHE_DIR=/tmp/translation-cache
 
 # espeak-ng: grapheme→phoneme for Kokoro. ffmpeg/libsndfile: audio decode/encode.
 RUN apt-get update && apt-get install -y --no-install-recommends \

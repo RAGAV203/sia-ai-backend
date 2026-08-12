@@ -21,9 +21,17 @@ _ABBREVIATIONS = {
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
 }
 
-# A sentence ends at .!? + whitespace, but only when what precedes the period is
-# not an abbreviation and what follows looks like a new sentence.
-_BOUNDARY = re.compile(r"(?<=[.!?])[\"')\]]*\s+")
+# A sentence ends at .!?, or at a danda, + whitespace — but only when what
+# precedes it is not an abbreviation and what follows looks like a new sentence.
+#
+# `।` (U+0964 devanagari danda) is Hindi's full stop and is what the translator
+# emits for one. Without it here, a three-sentence Hindi answer is a single
+# 300-character clip: the listener waits through the whole synthesis before
+# hearing a word, which is exactly the latency that sentence streaming exists to
+# remove. `॥` (double danda) is included for completeness; it is rare in prose.
+#
+# Tamil and Malay both use the Latin full stop, so they need nothing extra.
+_BOUNDARY = re.compile(r"(?<=[.!?।॥])[\"')\]]*\s+")
 
 MIN_SENTENCE_CHARS = 25   # below this, merge forward — a 3-word clip isn't worth a request
 MAX_SENTENCE_CHARS = 320  # above this, synthesis latency defeats the point of streaming

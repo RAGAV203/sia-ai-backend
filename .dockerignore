@@ -6,6 +6,7 @@ venv/
 # Audio artifacts and caches — regenerated at runtime.
 *.wav
 tts-cache/
+translation-cache/
 
 # Model weights are downloaded inside the image by download_models.py, not
 # copied from the build context (they are large and often absent locally).

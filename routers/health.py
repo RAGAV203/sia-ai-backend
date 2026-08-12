@@ -14,9 +14,11 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
-from config import KB_ENABLED, ONNX_THREADS, TTS_LANG, TTS_VOICE
+import languages
+from config import KB_ENABLED, ONNX_THREADS, PREWARM_LANGS, TTS_VOICE
 from services import prewarm, runtime
 from services import stt as stt_service
+from services import translate as translate_service
 from services import tts as tts_service
 
 router = APIRouter(tags=["health"])
@@ -26,13 +28,25 @@ router = APIRouter(tags=["health"])
 def health():
     return {
         "ok": True,
+        "languages": {
+            "supported": languages.codes(),
+            "default": languages.DEFAULT_LANG,
+            "prewarm": PREWARM_LANGS,
+        },
         "tts": {
             "voice": TTS_VOICE,
-            "lang": TTS_LANG,
+            # One voice covers all four: hf_alpha is a Hindi speaker and every
+            # espeak phoneme these languages produce is inside Kokoro's vocab.
+            "langs": {code: languages.get(code).espeak for code in languages.codes()},
             "model": Path(tts_service.resolve_model_path()).name,
             "onnx_threads": ONNX_THREADS,
         },
         "stt": stt_service.status(),
+        # Non-English answers are English answers that were translated, so a
+        # translation layer that is not ready means every non-English visitor is
+        # silently being served English — exactly the kind of degradation this
+        # endpoint exists to make visible.
+        "translation": translate_service.status(),
         "prewarm": dict(prewarm.status),
         "knowledge_base": _kb_status(),
     }

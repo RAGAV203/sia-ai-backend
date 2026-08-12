@@ -33,13 +33,40 @@ KOKORO_MODEL = os.getenv("KOKORO_MODEL", "auto")
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "voices-v1.0.bin")
 # hf_alpha = Hindi female -> Indian-accented English. lang="en-us" keeps English
 # pronunciation correct while the speaker embedding supplies the accent.
+#
+# One voice serves all four languages. hf_alpha is a Hindi speaker, and every
+# phoneme espeak-ng produces for Tamil and Malay falls inside Kokoro's 114-symbol
+# vocabulary, so they synthesize in the same voice through the same cache. See
+# languages.py for what that does and does not buy.
 TTS_VOICE = os.getenv("TTS_VOICE", "hf_alpha")
+
+# The phonemizer language for *English* only; every other language takes its
+# espeak code from the registry in languages.py. This stays configurable because
+# it was, and a deployment that set it to en-gb should keep getting en-gb.
 TTS_LANG = os.getenv("TTS_LANG", "en-us")
 TTS_SPEED = float(os.getenv("TTS_SPEED", "0.9"))  # a touch slower -> calm, gentle
 
 # Default next to the app (not /tmp, which isn't a real path on Windows) so the
 # cache survives restarts. Docker/Render override it with TTS_CACHE_DIR.
 CACHE_DIR = Path(os.getenv("TTS_CACHE_DIR", str(APP_DIR / "tts-cache")))
+
+# --- languages ----------------------------------------------------------------
+# Which of the four registered languages this deployment offers. Trimming the
+# list is the supported way to run English-only on a small host: it shrinks the
+# boot prewarm proportionally, since every language warms its own clips.
+SUPPORTED_LANGS = [
+    code.strip().lower()
+    for code in os.getenv("SUPPORTED_LANGS", "en,ta,hi,ms").split(",")
+    if code.strip()
+]
+
+# Translations of the fixed strings live here, keyed by content hash. Same
+# reasoning as CACHE_DIR: beside the app so it survives a restart, because a
+# cold translation cache also means a cold TTS cache — the clips are keyed on
+# the translated text.
+TRANSLATION_CACHE_DIR = Path(
+    os.getenv("TRANSLATION_CACHE_DIR", str(APP_DIR / "translation-cache"))
+)
 
 # Sentences synthesized concurrently, each on its own Kokoro session.
 #
@@ -94,6 +121,19 @@ TTS_MEM_ARENA = _flag("TTS_MEM_ARENA")
 # models. WARMUP=1 is honoured as the older name for the same flag.
 PREWARM = _flag("PREWARM", os.getenv("WARMUP", "1"))
 
+# Languages to prewarm, and in what order. English first is not cosmetic: the
+# prewarm thread is serial, so whichever language is listed first is the one
+# that is instant for the first visitor. The rest fill in over the following
+# minute or two while the service is already answering.
+#
+# Defaults to every supported language. Set to `en` on a host where the extra
+# boot CPU matters more than a first Tamil visitor waiting for synthesis.
+PREWARM_LANGS = [
+    code.strip().lower()
+    for code in os.getenv("PREWARM_LANGS", ",".join(SUPPORTED_LANGS)).split(",")
+    if code.strip()
+]
+
 # Load the Whisper *fallback* at boot. Now that Gemini serves the STT path, this
 # defaults off: it costs ~200 MB resident to shave a model load off a code path
 # that only runs when the API is unreachable. Set PREWARM_STT=1 on a deployment
@@ -104,3 +144,4 @@ PREWARM_STT = _flag("PREWARM_STT", "0")
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TRANSLATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)

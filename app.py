@@ -33,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from config import ALLOW_ORIGINS, KB_ENABLED
-from routers import chat, health, voice
+from routers import chat, health, input as input_router, voice
 from services import prewarm, runtime
 
 
@@ -55,6 +55,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(voice.router)
+app.include_router(input_router.router)
 
 
 # Response bodies worth reading back: JSON and text. Audio and the TTS stream are

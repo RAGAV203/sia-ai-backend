@@ -30,6 +30,56 @@ see [`kb/README.md`](./kb/README.md) for the retrieval design and the security
 model. Without a `GEMINI_API_KEY` (or with `KB_ENABLED=0`) it falls back to the
 curated answers in [`knowledge.py`](./knowledge.py), whose clips are prewarmed.
 
+## Languages
+
+English, Tamil, Hindi and Malay, selected by the client and carried on every
+endpoint as `lang`. The registry is [`languages.py`](./languages.py).
+
+**English is the pivot, not merely the default.** A non-English question is
+translated to English on the way in, the entire existing pipeline runs on
+English exactly as it always has, and the guarded English answer is translated
+on the way out:
+
+```
+question (ta) ─▶ guard ─▶ intent ─┬─▶ TRANSLATE IN ─▶ [English pipeline] ─▶ TRANSLATE OUT ─▶ answer (ta)
+                                  └─▶ canned reply (no model call at all)
+```
+
+Answering natively in Tamil would be one API call instead of two, and it breaks
+three things at once — which is why it isn't done:
+
+* `kb/guard.py` detects a refusal by matching English verb families. A Tamil
+  refusal matches none of them, so it is marked `grounded` and **cached**,
+  pinning "I don't know" to a question the corpus can answer.
+* `kb/answer_cache.py` compares questions with a local English MiniLM. Tamil
+  vectors from it are not worse, they are meaningless.
+* `kb/triage.py` reads the question as a *request* using English imperatives. In
+  Tamil it sees nothing, and every out-of-scope question reaches the model.
+
+Two things fall out of the pivot that are worth knowing. The answer cache is
+**shared across all four languages** — a Tamil visitor asking about fees hits the
+entry an English visitor created — and the guards keep their calibration, so
+adding a fifth language touches `languages.py` and `services/translate.py`
+rather than every pattern list in the tree.
+
+The intent gate runs *before* the translation and matches social turns in their
+own script, so "நன்றி" costs no model call at all.
+
+**One voice covers all four.** `hf_alpha` is a Hindi female speaker, and every
+phoneme espeak-ng produces for Tamil and Malay falls inside Kokoro's 114-symbol
+IPA vocabulary — measured 100% coverage per language. So there is one engine,
+one disk cache, no new dependency and no per-request cost. Hindi is native
+quality. Tamil and Malay are intelligible and in the right voice, but carry an
+Indian-English accent and lose some vowel-length distinctions, because Kokoro
+was never *trained* on them. If that ever becomes the limiting factor, the fix
+is a second backend behind `services.tts.cached_wav`; nothing above that
+function needs to know.
+
+`GET /translit?text=vanakkam&lang=ta` proxies Google Input Tools so a QWERTY
+keyboard can type Tamil and Hindi. It is on the keystroke path, so it caches
+aggressively, times out fast, and degrades to empty candidates rather than an
+error.
+
 ## How a question is answered
 
 Retrieve-then-generate is not enough, and one example shows why. Asked to

@@ -34,9 +34,11 @@ import os
 import re
 import threading
 import time
+import unicodedata
 
 import numpy as np
 
+import languages
 from kb import debug, gemini
 
 # The words a general-purpose recognizer has no reason to know, fed to Gemini as
@@ -60,6 +62,73 @@ TRANSCRIBE_PROMPT = (
     "Rules: output ONLY the transcript. No quotes, no speaker labels, no commentary, "
     "no translation. If there is no intelligible speech, output exactly: (no speech)"
 )
+
+
+def _prompt_for(language) -> str:
+    """The transcription prompt for a given spoken language.
+
+    Three instructions carry the weight for the non-English languages, and all
+    three were measured failure modes rather than precautions:
+
+    * **Show the script, do not merely name it.** This is the big one. Told
+      "write the transcript in the native script of Tamil", Gemini returns
+      romanized Tamil — measured **0%** of letters in Tamil script, on every
+      clip tried. Given a concrete example of the target script and told plainly
+      that romanization is wrong, the same model on the same audio returns
+      **100%**. Naming the script is not an instruction a model can act on;
+      seeing one is.
+
+      This matters beyond looking right. A romanized transcript is echoed into
+      the chat as the visitor's own message, where it reads as broken, and it is
+      handed to a translator that has been told to expect Tamil.
+
+    * **Forbid translating.** A model given Tamil audio and an English prompt
+      tends to answer in the prompt's language rather than the audio's, silently
+      turning transcription into translation — and the pipeline downstream would
+      then translate it *again*.
+
+    * **Keep the English glossary.** Code-switching is the norm here: a Tamil
+      speaker asking about admissions still says "B.Com" and "placement cell" in
+      English, and those are exactly the tokens that get mangled without a bias
+      list.
+    """
+    if language.code == "en":
+        return TRANSCRIBE_PROMPT
+
+    name = language.english_name
+    return (
+        f"Transcribe this {name} audio into {name} text.\n\n"
+        f"SCRIPT: The output MUST be written in {name}'s own script, like this: "
+        f"{language.script_sample}\n"
+        f"Romanized {name} written in the Latin alphabet is WRONG and unusable. "
+        f"Never write {name} words using English letters.\n\n"
+        f"The speaker may use English loanwords for academic terms (admission, "
+        f"placement, B.Com). Write those in {name} script too, spelled as they are "
+        f"pronounced, EXCEPT for the college's own name which stays as it sounds.\n"
+        f"Context: a question about an Indian women's college in Chennai. "
+        f"Proper nouns you may hear: {GLOSSARY}.\n\n"
+        f"Output ONLY the transcript. Do not translate to English. No quotes, no "
+        f"commentary. If there is no intelligible speech, output exactly: (no speech)"
+    )
+
+
+def native_script_ratio(text: str, script: str) -> float:
+    """Fraction of letters written in `script`. 1.0 means fully native.
+
+    Used only as a diagnostic. The prompt above reliably produces native script,
+    but "reliably" is a measurement of today's model, and a future revision
+    drifting back to romanized output would otherwise be invisible from the
+    server side — the transcript would still be a plausible sentence, still
+    answerable, and still wrong in the chat bubble.
+    """
+    prefix = {"tamil": "TAMIL", "devanagari": "DEVANAGARI"}.get(script)
+    if not prefix:
+        return 1.0  # Latin-script language: nothing to check
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 1.0
+    native = sum(1 for c in letters if unicodedata.name(c, "").startswith(prefix))
+    return native / len(letters)
 
 STT_BACKEND = os.getenv("STT_BACKEND", "gemini").strip().lower()
 
@@ -173,16 +242,20 @@ def clean_transcript(text: str) -> str:
 
 # --- engines ------------------------------------------------------------------
 
-def _via_gemini(wav: bytes) -> str:
+def _via_gemini(wav: bytes, language) -> str:
     return clean_transcript(
-        gemini.transcribe(wav, "audio/wav", prompt=TRANSCRIBE_PROMPT)
+        gemini.transcribe(wav, "audio/wav", prompt=_prompt_for(language))
     )
 
 
-def _via_whisper(samples: np.ndarray) -> str:
+def _via_whisper(samples: np.ndarray, language) -> str:
     segments, info = get_whisper().transcribe(
         samples,
-        language=WHISPER_LANG,
+        # The registry's code, not WHISPER_LANG. The env var stays as the
+        # deployment-wide default for a request that names no language, but a
+        # request that does must win — Whisper transcribing Tamil audio under
+        # `language="en"` does not fail, it invents plausible English.
+        language=language.whisper,
         beam_size=5,          # 1 was chosen when this was the only engine and
                               # latency mattered most; as the fallback it should
                               # favour accuracy, and 5 is the usual sweet spot.
@@ -204,14 +277,17 @@ def _via_whisper(samples: np.ndarray) -> str:
 
 # --- public API ---------------------------------------------------------------
 
-def transcribe(raw: bytes, filename: str = "") -> dict:
+def transcribe(raw: bytes, filename: str = "", lang: str = "") -> dict:
     """Transcribe a recorded clip. Blocking — always call off the event loop.
 
-    Returns ``{"text", "engine", "duration_s"}``. ``text`` is empty when the clip
-    carried no speech, which the caller reports differently from a failure.
+    Returns ``{"text", "engine", "duration_s", "lang"}``. ``text`` is empty when
+    the clip carried no speech, which the caller reports differently from a
+    failure. ``lang`` echoes the language actually used, so a client can tell a
+    fallback from a mis-set picker.
     """
+    language = languages.get(lang or WHISPER_LANG)
     started = time.perf_counter()
-    debug.section("STT")
+    debug.section(f"STT [{language.code}]")
 
     try:
         samples = decode(raw)
@@ -234,13 +310,18 @@ def transcribe(raw: bytes, filename: str = "") -> dict:
     # words from room tone given the chance.
     if peak < SILENT_PEAK:
         debug.log("silent clip — not transcribing")
-        return {"text": "", "engine": "none", "duration_s": round(duration, 2)}
+        return {
+            "text": "",
+            "engine": "none",
+            "duration_s": round(duration, 2),
+            "lang": language.code,
+        }
 
     engine = "whisper"
     text = ""
     if STT_BACKEND == "gemini" and gemini.available():
         try:
-            text = _via_gemini(to_wav(samples))
+            text = _via_gemini(to_wav(samples), language)
             engine = "gemini"
         except Exception as exc:  # noqa: BLE001 - fall through to the local model
             if not STT_FALLBACK:
@@ -251,12 +332,29 @@ def transcribe(raw: bytes, filename: str = "") -> dict:
     if engine != "gemini":
         if not STT_FALLBACK:
             raise RuntimeError("speech-to-text unavailable (STT_FALLBACK=0 and Gemini unreachable)")
-        text = _via_whisper(samples)
+        text = _via_whisper(samples, language)
 
     elapsed = (time.perf_counter() - started) * 1000
-    debug.log(f"engine={engine} in {elapsed:.0f} ms")
+    debug.log(f"engine={engine} lang={language.code} in {elapsed:.0f} ms")
+
+    # A transcript that came back romanized is still a usable sentence, so it
+    # cannot be detected downstream — it is only wrong on screen and in the
+    # translator's assumptions. Surface it here rather than nowhere.
+    ratio = native_script_ratio(text, language.script)
+    if text and ratio < 0.5:
+        print(
+            f"[stt] {language.code}: transcript is {(1 - ratio) * 100:.0f}% Latin — "
+            f"the model romanized instead of using {language.script} script"
+        )
+        debug.log(f"native-script ratio {ratio:.2f} (expected ~1.0)")
+
     debug.block("TRANSCRIPT", text or "(empty)")
-    return {"text": text, "engine": engine, "duration_s": round(duration, 2)}
+    return {
+        "text": text,
+        "engine": engine,
+        "duration_s": round(duration, 2),
+        "lang": language.code,
+    }
 
 
 def status() -> dict:
@@ -265,4 +363,5 @@ def status() -> dict:
         "gemini_ready": STT_BACKEND == "gemini" and gemini.available(),
         "fallback": WHISPER_MODEL if STT_FALLBACK else None,
         "fallback_loaded": _whisper is not None,
+        "languages": languages.codes(),
     }

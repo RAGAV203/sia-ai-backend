@@ -12,6 +12,11 @@ env/
 # Generated audio / cache
 *.wav
 tts-cache/
+# Translations of the fixed strings, keyed by content hash. Reproducible from
+# the source English via the API, so it is derived rather than authored — but
+# note that discarding it also cold-starts the TTS cache, because the clips are
+# keyed on the *translated* text.
+translation-cache/
 
 # Env / editor / OS
 .env
