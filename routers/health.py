@@ -15,7 +15,7 @@ from pathlib import Path
 from fastapi import APIRouter
 
 import languages
-from config import KB_ENABLED, ONNX_THREADS, PREWARM_LANGS, TTS_VOICE
+from config import KB_ENABLED, ONNX_THREADS, PREWARM_LANGS
 from services import prewarm, runtime
 from services import stt as stt_service
 from services import translate as translate_service
@@ -33,11 +33,18 @@ def health():
             "default": languages.DEFAULT_LANG,
             "prewarm": PREWARM_LANGS,
         },
+        # Per language, because they no longer share one backend: Kokoro
+        # carries English, Hindi and Malay, while Tamil is delegated to a
+        # neural voice it does not have the training to pronounce.
         "tts": {
-            "voice": TTS_VOICE,
-            # One voice covers all four: hf_alpha is a Hindi speaker and every
-            # espeak phoneme these languages produce is inside Kokoro's vocab.
-            "langs": {code: languages.get(code).espeak for code in languages.codes()},
+            "voices": {
+                code: {
+                    "voice": tts_service.voice_for(code),
+                    "backend": tts_service.backend_of(tts_service.voice_for(code)),
+                    "espeak": languages.get(code).espeak,
+                }
+                for code in languages.codes()
+            },
             "model": Path(tts_service.resolve_model_path()).name,
             "onnx_threads": ONNX_THREADS,
         },

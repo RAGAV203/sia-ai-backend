@@ -27,12 +27,15 @@ import soundfile as sf
 from config import (
     APP_DIR,
     CACHE_DIR,
+    GEMINI_TTS_MODEL,
     KOKORO_MODEL,
     KOKORO_VOICES,
     ONNX_THREADS,
     SYNTH_WORKERS,
     TRIM_SILENCE,
     TTS_MEM_ARENA,
+    TTS_VOICE,
+    TTS_VOICE_OVERRIDES,
 )
 from kb import debug
 
@@ -189,7 +192,7 @@ def _trim_edges(samples: np.ndarray, sample_rate: int) -> np.ndarray:
 _phonemize_lock = threading.Lock()
 
 
-def _synth_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
+def _synth_kokoro(text: str, voice: str, lang: str, speed: float) -> bytes:
     kokoro = get_kokoro()
     with _phonemize_lock:
         phonemes = kokoro.tokenizer.phonemize(text, lang)
@@ -201,6 +204,148 @@ def _synth_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, samples, sample_rate, format="WAV", subtype="PCM_16")
     return buf.getvalue()
+
+
+def _to_wav(encoded: bytes, speed: float) -> bytes:
+    """Decode a remote backend's compressed audio into this service's WAV format.
+
+    Every clip in the system is 24 kHz PCM-16 WAV, and keeping that true for the
+    remote voices too is worth the decode. Two reasons, and the second is the
+    one that matters:
+
+    * The client hands each clip straight to ``decodeAudioData``, which is
+      format-agnostic — so this is not about playback.
+    * ``_trim_edges`` is. Sentence streaming butt-joins clips on the audio
+      timeline, so every clip's own leading and trailing silence becomes a gap
+      at a seam. The trimmer works on samples, so a clip that stays compressed
+      cannot be trimmed, and Tamil would inherit a pause at every sentence
+      boundary that no other language has.
+
+    The size cost is real (a 26 KB MP3 becomes ~210 KB of WAV) but it is exactly
+    what English already ships today, and it is paid once per sentence ever
+    because the result goes in the disk cache.
+    """
+    from faster_whisper.audio import decode_audio
+
+    samples = decode_audio(io.BytesIO(encoded), sampling_rate=24000)
+    if TRIM_SILENCE:
+        samples = _trim_edges(samples, 24000)
+    buf = io.BytesIO()
+    sf.write(buf, samples, 24000, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def _synth_edge(text: str, voice: str, speed: float) -> bytes:
+    """Microsoft Edge's neural voices — used for Tamil (see config).
+
+    Synchronous on purpose despite the library being async: this is called from
+    the synthesis thread pool, where every other backend is blocking too, and
+    handing an event loop up through `cached_wav` would mean rewriting the pool,
+    the prewarm thread and the streaming generator around it for no gain.
+    """
+    import asyncio
+
+    import edge_tts
+
+    # edge-tts expresses rate as a percentage delta from the voice's natural
+    # pace. Kokoro's 0.9 is "a touch slower, calm and gentle"; the same intent
+    # here is -10%.
+    rate = f"{round((speed - 1.0) * 100):+d}%"
+
+    async def run() -> bytes:
+        chunks: list[bytes] = []
+        async for chunk in edge_tts.Communicate(text, voice, rate=rate).stream():
+            if chunk["type"] == "audio":
+                chunks.append(chunk["data"])
+        return b"".join(chunks)
+
+    # A fresh loop per call rather than asyncio.run() at import scope: these run
+    # on pool threads, which have no running loop of their own, and asyncio.run
+    # refuses to nest inside one if this is ever called from an async context.
+    loop = asyncio.new_event_loop()
+    try:
+        mp3 = loop.run_until_complete(run())
+    finally:
+        loop.close()
+
+    if not mp3:
+        raise RuntimeError("edge-tts returned no audio")
+    return _to_wav(mp3, speed)
+
+
+def _synth_gemini(text: str, voice: str, speed: float) -> bytes:
+    """Gemini's TTS models. Highest measured fidelity, 3 requests/minute free.
+
+    Kept behind the same interface as the others so a paid key can switch to it
+    with an env var, but not the default — see config.TTS_VOICE_OVERRIDES for
+    why the quota makes it unusable for streamed answers on the free tier.
+    """
+    import wave
+
+    from google.genai import types
+
+    from kb import gemini
+
+    response = gemini.with_retry(
+        lambda: gemini.client().models.generate_content(
+            model=GEMINI_TTS_MODEL,
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                    )
+                ),
+            ),
+        ),
+        what="tts",
+        retries=2,
+    )
+    pcm = response.candidates[0].content.parts[0].inline_data.data
+    if not pcm:
+        raise RuntimeError("gemini tts returned no audio")
+    # Raw 24 kHz PCM-16 mono, so it only needs a container.
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(24000)
+        handle.writeframes(pcm)
+    return _to_wav(buf.getvalue(), speed)
+
+
+def _synth_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
+    """Synthesize one clip with whichever backend `voice` names.
+
+    The backend is encoded in the voice string ("edge:ta-IN-PallaviNeural")
+    rather than passed separately, because the voice is already part of the
+    disk-cache key. That means switching Tamil to a neural voice gives it fresh
+    keys while leaving every English, Hindi and Malay clip already on disk
+    reachable — where bumping AUDIO_FORMAT_VERSION would have thrown away the
+    whole cache to change one language.
+    """
+    backend, _, name = voice.partition(":")
+    if not name:
+        return _synth_kokoro(text, voice, lang, speed)
+    if backend == "edge":
+        return _synth_edge(text, name, speed)
+    if backend == "gemini":
+        return _synth_gemini(text, name, speed)
+    raise ValueError(f"unknown TTS backend {backend!r} in voice {voice!r}")
+
+
+def voice_for(lang_code: str) -> str:
+    """The voice to synthesize `lang_code` with.
+
+    Returns a plain Kokoro voice name, or a "backend:voice" string for a
+    language that config delegates elsewhere.
+    """
+    return TTS_VOICE_OVERRIDES.get(lang_code, TTS_VOICE)
+
+
+def backend_of(voice: str) -> str:
+    return voice.partition(":")[0] if ":" in voice else "kokoro"
 
 
 def cached_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
@@ -224,7 +369,22 @@ def cached_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
         return path.read_bytes()
 
     started = time.perf_counter()
-    data = _synth_wav(text, voice, lang, speed)
+    try:
+        data = _synth_wav(text, voice, lang, speed)
+    except Exception as exc:  # noqa: BLE001 - the avatar must never go silent
+        if backend_of(voice) == "kokoro":
+            raise
+        # A remote voice failed: no network, a changed upstream, an exhausted
+        # quota. Kokoro can always speak this text — accented for Tamil, which
+        # is the whole reason the override exists, but intelligible and instant.
+        print(f"[tts] {voice} failed ({type(exc).__name__}: {exc}); using Kokoro")
+        debug.log(f"[tts] {voice} failed -> kokoro fallback")
+        # Deliberately NOT cached. Writing it under the neural voice's key would
+        # pin the degraded clip forever, so a transient outage would permanently
+        # cost Tamil the voice it was configured to use. Returning it uncached
+        # means the next request tries the real backend again.
+        return _synth_kokoro(text, TTS_VOICE, lang, speed)
+
     if debug.ENABLED:
         seconds = (len(data) - 44) / (24000 * 2)
         elapsed = time.perf_counter() - started

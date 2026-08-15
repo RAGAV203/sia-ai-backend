@@ -10,6 +10,17 @@ kokoro-onnx>=0.4.9
 soundfile>=0.12
 numpy>=1.26,<2.3
 
+# --- TTS: neural voices for languages Kokoro cannot pronounce ---
+# Tamil only, by default. Kokoro carries Tamil phonetically but was never
+# trained on it, and reads it audibly as a Hindi speaker would — measured 73.8%
+# round-trip fidelity through STT against ~96% for ta-IN-PallaviNeural.
+#
+# Pure-Python and tiny, and the service degrades to Kokoro automatically if the
+# endpoint is unreachable (it is Microsoft's, and unofficial), so this is a
+# quality dependency rather than a load-bearing one. Set TTS_VOICE_OVERRIDES=""
+# to drop back to Kokoro everywhere.
+edge-tts>=6.1
+
 # --- Gemini: answering, embeddings, and speech-to-text ---
 # One SDK covers all three. Replaces llama-cpp-python (~1 GB of local weights)
 # and the Anthropic client.

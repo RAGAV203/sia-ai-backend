@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 import languages
-from config import TTS_SPEED, TTS_VOICE
+from config import TTS_SPEED
 from services import stt as stt_service
 from services import tts as tts_service
 from speech import split_sentences
@@ -26,17 +26,25 @@ class TtsRequest(BaseModel):
     speed: Optional[float] = None
 
 
-def _espeak(lang: Optional[str]) -> str:
-    """Phonemizer language for a request's `lang` field.
+def _voice_and_espeak(req_voice: Optional[str], lang: Optional[str]) -> tuple[str, str]:
+    """The (voice, phonemizer-language) pair for a request.
 
-    The wire now carries our two-letter codes ("ta"), but this endpoint took raw
-    espeak codes ("en-us") before there was more than one language, and the TTS
-    disk cache is keyed on whatever is passed down from here. Resolving through
-    the registry — which accepts both spellings and returns the espeak code —
-    keeps every clip synthesized before this change reachable, instead of
+    Two lookups that both have to agree, resolved together so they cannot drift.
+
+    The **voice** is per-language now: Tamil is delegated to a neural backend
+    because Kokoro reads it with a Hindi accent (see config.TTS_VOICE_OVERRIDES).
+    An explicit `voice` in the request still wins, which is what makes it
+    possible to A/B the backends against each other from the client.
+
+    The **espeak code** comes from the registry rather than the wire. This
+    endpoint took raw espeak codes ("en-us") before there was more than one
+    language, and the TTS disk cache is keyed on whatever is passed down from
+    here — so resolving through the registry, which accepts both spellings,
+    keeps every clip synthesized before this change reachable instead of
     orphaning the whole cache on a rename.
     """
-    return languages.get(lang).espeak
+    language = languages.get(lang)
+    return (req_voice or tts_service.voice_for(language.code)), language.espeak
 
 
 @router.get("/voices")
@@ -57,10 +65,9 @@ def tts(req: TtsRequest):
     if not text:
         raise HTTPException(status_code=400, detail="`text` is required")
 
+    voice, espeak = _voice_and_espeak(req.voice, req.lang)
     try:
-        data = tts_service.cached_wav(
-            text, req.voice or TTS_VOICE, _espeak(req.lang), req.speed or TTS_SPEED
-        )
+        data = tts_service.cached_wav(text, voice, espeak, req.speed or TTS_SPEED)
     except Exception as exc:  # noqa: BLE001 - surface a clean 500 to the client
         raise HTTPException(status_code=500, detail=f"tts failed: {exc}") from exc
 
@@ -99,8 +106,7 @@ def tts_stream(req: TtsRequest):
     if not text:
         raise HTTPException(status_code=400, detail="`text` is required")
 
-    voice = req.voice or TTS_VOICE
-    lang = _espeak(req.lang)
+    voice, lang = _voice_and_espeak(req.voice, req.lang)
     speed = req.speed or TTS_SPEED
     sentences = split_sentences(text)
 

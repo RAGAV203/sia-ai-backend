@@ -40,6 +40,51 @@ KOKORO_VOICES = os.getenv("KOKORO_VOICES", "voices-v1.0.bin")
 # languages.py for what that does and does not buy.
 TTS_VOICE = os.getenv("TTS_VOICE", "hf_alpha")
 
+# Languages whose synthesis is delegated to a neural voice instead of Kokoro.
+#
+# Kokoro carries Tamil *phonetically* — every espeak phoneme lands inside its
+# vocabulary — but it was never trained on Tamil prosody, and the result is
+# audibly a Hindi speaker reading Tamil aloud. Measured by round-tripping each
+# clip back through speech-to-text, which is the closest thing to an objective
+# pronunciation score available here:
+#
+#   Kokoro hf_alpha, Tamil        73.8%   hallucinated words, mangled compounds
+#   edge-tts ta-IN-Pallavi        ~96%    1.1-1.6 s per sentence
+#   gemini-3.1-flash-tts          98.6%   5-7 s per sentence
+#
+# Gemini scores highest and is unusable here anyway: the free tier allows **3
+# requests per minute** for the TTS models, and a four-sentence answer
+# synthesizes four clips concurrently, so a single Tamil reply exhausts the
+# quota before it finishes speaking. Set `ta=gemini:Sulafat` on a paid key.
+#
+# Format: `code=backend:voice`, comma separated. Anything not listed uses
+# Kokoro with TTS_VOICE, so English, Hindi and Malay are untouched — Hindi is
+# native to hf_alpha and Malay measured fine.
+_DEFAULT_VOICE_OVERRIDES = "ta=edge:ta-IN-PallaviNeural"
+
+
+def _parse_overrides(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        code, voice = item.split("=", 1)
+        code, voice = code.strip().lower(), voice.strip()
+        if code and voice:
+            out[code] = voice
+    return out
+
+
+# Set TTS_VOICE_OVERRIDES="" to force Kokoro everywhere (no network, no
+# unofficial endpoint) at the cost of the Tamil accent.
+TTS_VOICE_OVERRIDES = _parse_overrides(
+    os.getenv("TTS_VOICE_OVERRIDES", _DEFAULT_VOICE_OVERRIDES)
+)
+
+# Only consulted when a voice override names the `gemini` backend.
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+
 # The phonemizer language for *English* only; every other language takes its
 # espeak code from the registry in languages.py. This stays configurable because
 # it was, and a deployment that set it to en-gb should keep getting en-gb.

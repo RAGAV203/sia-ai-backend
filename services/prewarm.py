@@ -32,10 +32,9 @@ from config import (
     PREWARM_LANGS,
     PREWARM_STT,
     TTS_SPEED,
-    TTS_VOICE,
 )
 from knowledge import public_suggestions, spoken_texts
-from services.tts import cached_wav, warm_sessions
+from services.tts import cached_wav, voice_for, warm_sessions
 from speech import split_sentences
 
 # Exposed on /health so "still warming" is distinguishable from "broken".
@@ -124,12 +123,16 @@ def _prewarm_language(lang: str, answer_cache) -> None:
     # corrupted counter rather than as progress.
     status["total"] += len(texts)
 
+    # Must match what /tts will ask for, key for key — a language warmed under
+    # the wrong voice fills the cache with entries nothing ever looks up, and
+    # every real request still synthesizes from cold.
+    voice = voice_for(language.code)
     for text in texts:
         # Synthesized per sentence, matching how `/tts/stream` will request it.
         # Warming the whole paragraph as one clip would fill the cache with keys
         # the streaming path never looks up.
         for sentence in split_sentences(text):
-            cached_wav(sentence, TTS_VOICE, language.espeak, TTS_SPEED)
+            cached_wav(sentence, voice, language.espeak, TTS_SPEED)
         entry["done"] += 1
         status["done"] += 1
 

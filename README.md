@@ -65,15 +65,41 @@ rather than every pattern list in the tree.
 The intent gate runs *before* the translation and matches social turns in their
 own script, so "நன்றி" costs no model call at all.
 
-**One voice covers all four.** `hf_alpha` is a Hindi female speaker, and every
-phoneme espeak-ng produces for Tamil and Malay falls inside Kokoro's 114-symbol
-IPA vocabulary — measured 100% coverage per language. So there is one engine,
-one disk cache, no new dependency and no per-request cost. Hindi is native
-quality. Tamil and Malay are intelligible and in the right voice, but carry an
-Indian-English accent and lose some vowel-length distinctions, because Kokoro
-was never *trained* on them. If that ever becomes the limiting factor, the fix
-is a second backend behind `services.tts.cached_wav`; nothing above that
-function needs to know.
+### Voices
+
+Kokoro carries English, Hindi and Malay: `hf_alpha` is a Hindi female speaker,
+and every phoneme espeak-ng produces for those languages falls inside Kokoro's
+114-symbol IPA vocabulary. One engine, one disk cache, no per-request cost.
+
+**Tamil is the exception.** Kokoro pronounces it *phonetically* but was never
+trained on it, and the result is audibly a Hindi speaker reading Tamil aloud —
+it mangles compounds and occasionally invents words. Since a clip cannot be
+listened to from a test suite, the backends were scored by round-tripping each
+one back through speech-to-text, which is the closest available proxy for "is
+this pronounced correctly":
+
+| backend | fidelity | per sentence | quota |
+|---|---|---|---|
+| Kokoro `hf_alpha` | **73.8%** | local | none |
+| edge-tts `ta-IN-PallaviNeural` | **93.7%** | 2.4–2.9 s | none |
+| `gemini-3.1-flash-tts` | **98.6%** | 5–7 s | **3 requests/minute** on the free tier |
+
+Gemini scores highest and is unusable by default: a four-sentence answer
+synthesizes four clips concurrently, so one Tamil reply exhausts the free quota
+before it finishes speaking. Set `TTS_VOICE_OVERRIDES=ta=gemini:Sulafat` on a
+paid key.
+
+The backend is encoded in the voice string (`edge:ta-IN-PallaviNeural`), which
+is already part of the TTS cache key — so Tamil got fresh keys while every
+English, Hindi and Malay clip already on disk stayed reachable. **A remote voice
+that fails falls back to Kokoro and is deliberately not cached**, so a transient
+outage costs one accented clip rather than permanently pinning one.
+
+Remote clips are decoded to the same 24 kHz PCM-16 WAV as everything else, which
+costs size (a 26 KB MP3 becomes ~210 KB) and buys the edge-trimming that keeps
+butt-joined sentences gapless — a compressed clip cannot be trimmed, and Tamil
+would otherwise inherit a pause at every sentence seam that no other language
+has.
 
 `GET /translit?text=vanakkam&lang=ta` proxies Google Input Tools so a QWERTY
 keyboard can type Tamil and Hindi. It is on the keystroke path, so it caches
