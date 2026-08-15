@@ -42,25 +42,46 @@ TTS_VOICE = os.getenv("TTS_VOICE", "hf_alpha")
 
 # Languages whose synthesis is delegated to a neural voice instead of Kokoro.
 #
-# Kokoro carries Tamil *phonetically* — every espeak phoneme lands inside its
-# vocabulary — but it was never trained on Tamil prosody, and the result is
-# audibly a Hindi speaker reading Tamil aloud. Measured by round-tripping each
-# clip back through speech-to-text, which is the closest thing to an objective
-# pronunciation score available here:
+# `hf_alpha` is a *Hindi* speaker embedding. That makes it genuinely native for
+# Hindi, and an approximation everywhere else — Kokoro carries the other
+# languages phonetically, because every espeak phoneme they produce lands inside
+# its vocabulary, but it was never trained on their prosody. Measured by
+# round-tripping each clip back through speech-to-text, the closest thing to an
+# objective pronunciation score available here:
 #
-#   Kokoro hf_alpha, Tamil        73.8%   hallucinated words, mangled compounds
-#   edge-tts ta-IN-Pallavi        ~96%    1.1-1.6 s per sentence
-#   gemini-3.1-flash-tts          98.6%   5-7 s per sentence
+#   TAMIL      Kokoro hf_alpha        73.8%   hallucinated words, mangled compounds
+#              edge ta-IN-Pallavi     ~94%    RTF 0.4
+#              gemini-3.1-flash-tts   98.6%   RTF ~1.5
 #
-# Gemini scores highest and is unusable here anyway: the free tier allows **3
-# requests per minute** for the TTS models, and a four-sentence answer
-# synthesizes four clips concurrently, so a single Tamil reply exhausts the
-# quota before it finishes speaking. Set `ta=gemini:Sulafat` on a paid key.
+#   ENGLISH    Kokoro hf_alpha        97.0%   RTF 0.48
+#              edge en-IN-Neerja      98.9%   RTF 0.23
 #
-# Format: `code=backend:voice`, comma separated. Anything not listed uses
-# Kokoro with TTS_VOICE, so English, Hindi and Malay are untouched — Hindi is
-# native to hf_alpha and Malay measured fine.
-_DEFAULT_VOICE_OVERRIDES = "ta=edge:ta-IN-PallaviNeural"
+# English is the interesting case, because in aggregate the two are a tie —
+# Kokoro's English pronunciation is not wrong, so the metric that settled Tamil
+# cannot settle English. What settles it is one word: asked to say
+# "Hi, I'm Sia", Kokoro produces something that transcribes back as **"Hi, I'm
+# J"**, while Neerja produces "Siya". That is the assistant's own name, in the
+# greeting, the identity reply and every introduction — the single most-spoken
+# word in the product, and the one it was getting wrong.
+#
+# Gemini scores highest for Tamil and is unusable anyway: the free tier allows
+# **3 requests per minute** for the TTS models, and a four-sentence answer
+# synthesizes four clips concurrently, so one reply exhausts the quota before it
+# finishes speaking. Set `ta=gemini:Sulafat` on a paid key.
+#
+# THE TRADE THIS MAKES. English is the default and the highest-traffic path, so
+# routing it through a network voice is a real cost, not a free upgrade: the
+# primary path now depends on an endpoint we do not control. Three things make
+# it survivable — the disk cache means a repeated sentence never leaves the box,
+# prewarm renders every fixed string at boot, and a failed remote synthesis
+# falls back to Kokoro uncached (see services/tts.cached_wav). Set
+# TTS_VOICE_OVERRIDES="" to put everything back on local synthesis.
+#
+# Format: `code=backend:voice`, comma separated. Anything not listed uses Kokoro
+# with TTS_VOICE. Hindi is deliberately absent — hf_alpha *is* a Hindi voice, so
+# it is already native there. Malay is the remaining approximation; add
+# `ms=edge:ms-MY-YasminNeural` to give it a native voice too.
+_DEFAULT_VOICE_OVERRIDES = "en=edge:en-IN-NeerjaNeural,ta=edge:ta-IN-PallaviNeural"
 
 
 def _parse_overrides(raw: str) -> dict[str, str]:
@@ -128,6 +149,22 @@ TRANSLATION_CACHE_DIR = Path(
 # holds its own copy of the weights (~92 MB int8, ~325 MB fp32), so 2 is the
 # default: it restores the margin and still fits a 512 MB instance.
 SYNTH_WORKERS = max(1, int(os.getenv("TTS_WORKERS", "2")))
+
+# Concurrency for the *remote* voices, which get their own pool.
+#
+# SYNTH_WORKERS above is a memory budget: each Kokoro worker holds its own copy
+# of the weights. A remote voice has the opposite profile — the thread sits on a
+# socket and costs nothing — so the two cannot share a width.
+#
+# Measured when English moved to a network voice and the pools were still
+# shared: a five-sentence answer serialized through two workers and reached
+# first audio in 3.85 s, against ~2 s for the same answer synthesized locally.
+# Widening only this fixed it without touching the Kokoro budget.
+#
+# Bounded rather than unbounded because this is also the concurrency pointed at
+# a third-party endpoint; six is enough to cover any answer the guard admits
+# (MAX_ANSWER_CHARS caps a reply at about six sentences) in a single round.
+NET_SYNTH_WORKERS = max(1, int(os.getenv("TTS_NET_WORKERS", "6")))
 
 # ONNX Runtime intra-op threads *per session*, so the pool as a whole stays
 # inside the core budget rather than oversubscribing it.

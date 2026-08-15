@@ -31,6 +31,7 @@ from config import (
     KOKORO_MODEL,
     KOKORO_VOICES,
     ONNX_THREADS,
+    NET_SYNTH_WORKERS,
     SYNTH_WORKERS,
     TRIM_SILENCE,
     TTS_MEM_ARENA,
@@ -401,7 +402,44 @@ def cached_wav(text: str, voice: str, lang: str, speed: float) -> bytes:
 
 
 _executor = None
+_net_executor = None
 _executor_lock = threading.Lock()
+
+
+def _network_pool():
+    """A separate, wider pool for the remote voices.
+
+    The Kokoro pool is deliberately narrow because each of its threads holds a
+    ~92 MB model session, so its width is a memory budget. A remote voice has
+    the opposite profile: the thread is asleep on a socket, costs nothing, and
+    the only thing width buys or loses is latency.
+
+    Sharing one pool made that concrete and measurable the moment English moved
+    to a network voice. A five-sentence English answer takes five WebSocket
+    round trips; through two workers they serialize into three rounds, and
+    **first audio landed at 3.85 s against ~2 s when the same answer was
+    synthesized locally** — a regression on the default path, caused entirely by
+    queueing rather than by the voice being slow. Widening this pool alone fixes
+    it without touching the Kokoro memory budget at all.
+
+    Bounded rather than unbounded: this is also the concurrency we point at a
+    third party, and a long answer should not open a dozen sockets at once.
+    """
+    global _net_executor
+    if _net_executor is None:
+        with _executor_lock:
+            if _net_executor is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _net_executor = ThreadPoolExecutor(
+                    max_workers=NET_SYNTH_WORKERS, thread_name_prefix="tts-net"
+                )
+    return _net_executor
+
+
+def _pool_for(voice: str):
+    """Whichever pool suits this voice's cost profile."""
+    return _pool() if backend_of(voice) == "kokoro" else _network_pool()
 
 
 def _pool():
@@ -482,7 +520,12 @@ def synthesize_ordered(sentences: list[str], voice: str, lang: str, speed: float
     """
     if not sentences:
         return
-    if SYNTH_WORKERS <= 1 or len(sentences) == 1:
+    pool = _pool_for(voice)
+    # The serial shortcut is only right for Kokoro, where one worker really does
+    # mean one session. A remote voice with several sentences always wants the
+    # network pool, however narrow the local one is configured to be.
+    serial = len(sentences) == 1 or (SYNTH_WORKERS <= 1 and backend_of(voice) == "kokoro")
+    if serial:
         for sentence in sentences:
             try:
                 yield cached_wav(sentence, voice, lang, speed)
@@ -500,7 +543,7 @@ def synthesize_ordered(sentences: list[str], voice: str, lang: str, speed: float
     # silence at the first seam, against none when all clips overlap. A listener
     # forgives a slightly later start; a gap in the middle of a sentence is the
     # exact defect this is meant to remove.
-    futures = [_pool().submit(cached_wav, s, voice, lang, speed) for s in sentences]
+    futures = [pool.submit(cached_wav, s, voice, lang, speed) for s in sentences]
     for future in futures:
         try:
             yield future.result()

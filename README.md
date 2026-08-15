@@ -67,33 +67,54 @@ own script, so "நன்றி" costs no model call at all.
 
 ### Voices
 
-Kokoro carries English, Hindi and Malay: `hf_alpha` is a Hindi female speaker,
-and every phoneme espeak-ng produces for those languages falls inside Kokoro's
-114-symbol IPA vocabulary. One engine, one disk cache, no per-request cost.
+`hf_alpha` is a **Hindi** female speaker. That makes Kokoro genuinely native for
+Hindi and an approximation everywhere else: it carries the other languages
+*phonetically*, because every phoneme espeak-ng produces for them falls inside
+Kokoro's 114-symbol IPA vocabulary, but it was never trained on their prosody.
 
-**Tamil is the exception.** Kokoro pronounces it *phonetically* but was never
-trained on it, and the result is audibly a Hindi speaker reading Tamil aloud —
-it mangles compounds and occasionally invents words. Since a clip cannot be
-listened to from a test suite, the backends were scored by round-tripping each
-one back through speech-to-text, which is the closest available proxy for "is
-this pronounced correctly":
+A clip cannot be listened to from a test suite, so each backend was scored by
+round-tripping its audio back through speech-to-text — the closest available
+proxy for "is this pronounced correctly".
 
-| backend | fidelity | per sentence | quota |
-|---|---|---|---|
-| Kokoro `hf_alpha` | **73.8%** | local | none |
-| edge-tts `ta-IN-PallaviNeural` | **93.7%** | 2.4–2.9 s | none |
-| `gemini-3.1-flash-tts` | **98.6%** | 5–7 s | **3 requests/minute** on the free tier |
+| language | voice | fidelity | RTF | |
+|---|---|---|---|---|
+| **en** | Kokoro `hf_alpha` | 97.0% | 0.48 | |
+| | edge-tts `en-IN-NeerjaNeural` | **98.9%** | **0.23** | ← default |
+| **ta** | Kokoro `hf_alpha` | 73.8% | 0.40 | |
+| | edge-tts `ta-IN-PallaviNeural` | **93.7%** | 0.40 | ← default |
+| | `gemini-3.1-flash-tts` | 98.6% | ~1.5 | 3 req/min free tier |
+| **hi** | Kokoro `hf_alpha` | — | 0.40 | ← default, already native |
+| **ms** | Kokoro `hf_alpha` | — | 0.40 | ← default, still an approximation |
 
-Gemini scores highest and is unusable by default: a four-sentence answer
-synthesizes four clips concurrently, so one Tamil reply exhausts the free quota
+**Tamil was obvious**: Kokoro mangles compounds and occasionally invents words —
+`வேலைவாய்ப்பு` came back as `வேலாய்வாய்ப்பு`, and one clip hallucinated `என்.ஏ.ஏ.சி`
+out of nothing.
+
+**English was not**, and it is the more interesting case. In aggregate the two
+are a tie, because Kokoro's English pronunciation is not wrong — so the metric
+that settled Tamil could not settle English. One word settled it instead: asked
+to say *"Hi, I'm Sia"*, Kokoro produces something that transcribes back as
+**"Hi, I'm J"**, while Neerja produces **"Siya"**. That is the assistant's own
+name, in the greeting, the identity reply and every introduction.
+
+Gemini scores highest for Tamil and is unusable by default: a four-sentence
+answer synthesizes four clips concurrently, so one reply exhausts the free quota
 before it finishes speaking. Set `TTS_VOICE_OVERRIDES=ta=gemini:Sulafat` on a
 paid key.
 
-The backend is encoded in the voice string (`edge:ta-IN-PallaviNeural`), which
-is already part of the TTS cache key — so Tamil got fresh keys while every
-English, Hindi and Malay clip already on disk stayed reachable. **A remote voice
-that fails falls back to Kokoro and is deliberately not cached**, so a transient
-outage costs one accented clip rather than permanently pinning one.
+**What this trades.** English is the default and busiest path, so routing it
+through a network voice is a real cost rather than a free upgrade — the primary
+path now depends on an endpoint outside our control. Three things make that
+survivable: the disk cache means a repeated sentence never leaves the box, the
+boot prewarm renders every fixed string, and **a remote voice that fails falls
+back to Kokoro and is deliberately not cached**, so an outage costs one accented
+clip rather than permanently pinning one. `TTS_VOICE_OVERRIDES=""` puts
+everything back on local synthesis.
+
+The backend is encoded in the voice string (`edge:en-IN-NeerjaNeural`), which is
+already part of the TTS cache key — so switching a language mints fresh keys and
+leaves every other language's clips reachable, where a format-version bump would
+have discarded the whole cache to change one voice.
 
 Remote clips are decoded to the same 24 kHz PCM-16 WAV as everything else, which
 costs size (a 26 KB MP3 becomes ~210 KB) and buys the edge-trimming that keeps
